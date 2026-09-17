@@ -515,6 +515,36 @@ class TestBoundingBox3DFuser(unittest.TestCase):
         expected = torch.tensor([0.0, 0.0, 0.5])
         self.assertTrue(torch.allclose(fused_pos, expected, atol=0.1))
 
+    def test_robust_envelope_preserves_consensus_object_faces(self):
+        """Partial detections must not pull a well-supported outer face inward."""
+        obbs = [
+            _make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        # These cover only the positive half of the same object.
+        obbs.extend(
+            _make_test_obb([0.5, 0.0, 0.5], sz=(1.0, 1.0, 1.0))
+            for _ in range(2)
+        )
+        detections = torch.stack(obbs)
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            confidence_weighting="uniform",
+            conf_threshold=0.0,
+            extent_method="robust_envelope",
+            envelope_quantile=0.4,
+            envelope_padding_m=0.03,
+        )
+
+        instance = fuser._fuse_clusters(detections, [list(range(5))])[0]
+        center_x = float(instance.obb.T_world_object.t[0])
+        extent_x = float(
+            instance.obb.bb3_object[1] - instance.obb.bb3_object[0]
+        )
+
+        self.assertLessEqual(center_x - extent_x / 2.0, -1.02)
+        self.assertGreaterEqual(center_x + extent_x / 2.0, 1.02)
+
     def test_empty_detections(self):
         """Empty input should return empty list."""
         fuser = BoundingBox3DFuser(min_detections=1, conf_threshold=0.0)

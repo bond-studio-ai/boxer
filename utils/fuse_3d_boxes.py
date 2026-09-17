@@ -107,6 +107,30 @@ def angular_distance(angle1: float, angle2: float) -> float:
     return diff
 
 
+def weighted_quantile(
+    values: torch.Tensor, weights: torch.Tensor, quantile: float
+) -> torch.Tensor:
+    """Return a weighted quantile for each column of a 2D tensor."""
+    if values.ndim != 2:
+        raise ValueError("values must have shape (N, D)")
+    if weights.ndim != 1 or weights.shape[0] != values.shape[0]:
+        raise ValueError("weights must have shape (N,)")
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be in [0, 1]")
+
+    outputs = []
+    normalized_weights = weights / (weights.sum() + 1e-8)
+    for dimension in range(values.shape[1]):
+        sorted_values, order = torch.sort(values[:, dimension])
+        cumulative = torch.cumsum(normalized_weights[order], dim=0)
+        index = torch.searchsorted(
+            cumulative,
+            torch.tensor(quantile, dtype=cumulative.dtype, device=cumulative.device),
+        ).clamp(max=len(sorted_values) - 1)
+        outputs.append(sorted_values[index])
+    return torch.stack(outputs)
+
+
 def align_boxes_r90(
     sizes: torch.Tensor,
     yaw_angles: torch.Tensor,
@@ -286,6 +310,9 @@ class BoundingBox3DFuser:
         enable_nms: bool = False,
         nms_iou_threshold: float = 0.6,
         conf_threshold: float = 0.55,
+        extent_method: str = "mean",
+        envelope_quantile: float = 0.4,
+        envelope_padding_m: float = 0.03,
     ) -> None:
         """
         Initialize 3D box fusion system.
@@ -298,6 +325,10 @@ class BoundingBox3DFuser:
             enable_nms: If True, apply NMS to fused boxes with high IoU and semantic similarity
             nms_iou_threshold: IoU threshold for NMS (boxes with IoU > this are redundant)
             conf_threshold: Minimum confidence threshold to keep detections (default: 0.55)
+            extent_method: ``mean`` for the original size average, or
+                ``robust_envelope`` to estimate lower/upper faces independently
+            envelope_quantile: Robust-envelope trim quantile in [0, 0.5]
+            envelope_padding_m: Metric padding on every robust-envelope face
         """
         self.iou_threshold = iou_threshold
         self.min_detections = min_detections
@@ -307,6 +338,15 @@ class BoundingBox3DFuser:
         self.enable_nms = enable_nms
         self.nms_iou_threshold = nms_iou_threshold
         self.conf_threshold = conf_threshold
+        if extent_method not in ("mean", "robust_envelope"):
+            raise ValueError(f"Unknown extent method: {extent_method}")
+        if not 0.0 <= envelope_quantile <= 0.5:
+            raise ValueError("envelope_quantile must be in [0, 0.5]")
+        if envelope_padding_m < 0.0:
+            raise ValueError("envelope_padding_m must be nonnegative")
+        self.extent_method = extent_method
+        self.envelope_quantile = envelope_quantile
+        self.envelope_padding_m = envelope_padding_m
 
     def fuse(
         self, detections: ObbTW, semantic_embeddings: Optional[torch.Tensor] = None
@@ -610,7 +650,7 @@ class BoundingBox3DFuser:
 
             # STEP 1: Align boxes to canonical orientation (accounts for 90° rotations)
             # Use base confidence weights for alignment reference
-            base_confidences = cluster_detections.prob.squeeze()  # (M,)
+            base_confidences = cluster_detections.prob.reshape(-1)  # (M,)
             base_weights = base_confidences / (base_confidences.sum() + 1e-8)
 
             aligned_sizes, aligned_yaws = self._align_boxes_r90(
@@ -623,9 +663,44 @@ class BoundingBox3DFuser:
                 cluster_detections, aligned_sizes, aligned_yaws
             )
 
-            # STEP 3: Fuse aligned sizes (weighted average)
-            weights_sizes = weights.view(-1, 1).expand_as(aligned_sizes)
-            fused_sizes = (aligned_sizes * weights_sizes).sum(dim=0)  # (3,)
+            # STEP 3: Fuse aligned yaw angles (weighted average with 180° symmetry)
+            mean_yaw, _ = self._weighted_yaw_mean(aligned_yaws, weights)
+
+            # Fuse translations and create the reference pose.
+            translations = torch.stack([pose.t for pose in poses])  # (M, 3)
+            weights_t = weights.view(-1, 1).expand_as(translations)
+            fused_translation = (translations * weights_t).sum(dim=0)  # (3,)
+            new_eulers = torch.tensor([0, 0, mean_yaw]).to(fused_translation)  # (3,)
+            new_eulers = new_eulers.reshape(1, 3)  # (1, 3)
+            fused_rotation = rotation_from_euler(new_eulers)[0]
+
+            # STEP 4: Estimate box extents. The robust-envelope mode projects
+            # every contributing box into the fused orientation and estimates
+            # its lower and upper faces independently. This avoids shrinking a
+            # long object when partial detections have shifted centers.
+            if self.extent_method == "robust_envelope":
+                corners_world = cluster_detections.bb3corners_world
+                corners_local = torch.matmul(
+                    corners_world - fused_translation.view(1, 1, 3),
+                    fused_rotation,
+                )
+                lower_faces = corners_local.min(dim=1).values
+                upper_faces = corners_local.max(dim=1).values
+                lower = weighted_quantile(
+                    lower_faces, weights, self.envelope_quantile
+                ) - self.envelope_padding_m
+                upper = weighted_quantile(
+                    upper_faces, weights, 1.0 - self.envelope_quantile
+                ) + self.envelope_padding_m
+                fused_sizes = (upper - lower).clamp_min(1e-4)
+                local_center = 0.5 * (lower + upper)
+                fused_translation = fused_translation + torch.matmul(
+                    fused_rotation, local_center
+                )
+            else:
+                weights_sizes = weights.view(-1, 1).expand_as(aligned_sizes)
+                fused_sizes = (aligned_sizes * weights_sizes).sum(dim=0)
+
             bb3_object = torch.stack(
                 [
                     -fused_sizes[0] / 2,
@@ -636,20 +711,6 @@ class BoundingBox3DFuser:
                     fused_sizes[2] / 2,
                 ]
             )
-
-            # STEP 4: Fuse aligned yaw angles (weighted average with 180° symmetry)
-            mean_yaw, _ = self._weighted_yaw_mean(aligned_yaws, weights)
-
-            # Create fused pose with aligned yaw
-            # Fuse translations (same as before)
-            translations = torch.stack([pose.t for pose in poses])  # (M, 3)
-            weights_t = weights.view(-1, 1).expand_as(translations)
-            fused_translation = (translations * weights_t).sum(dim=0)  # (3,)
-
-            # Create fused rotation with mean yaw
-            new_eulers = torch.tensor([0, 0, mean_yaw]).to(fused_translation)  # (3,)
-            new_eulers = new_eulers.reshape(1, 3)  # (1, 3)
-            fused_rotation = rotation_from_euler(new_eulers)[0]
             fused_pose = PoseTW.from_Rt(fused_rotation, fused_translation)
 
             # Fuse confidence (weighted average)
@@ -724,7 +785,7 @@ class BoundingBox3DFuser:
         Returns:
             Torch tensor of weights (sums to 1)
         """
-        confidences = detections.prob.squeeze()  # (M,)
+        confidences = detections.prob.reshape(-1)  # (M,)
 
         if self.confidence_weighting == "uniform":
             weights = torch.ones_like(confidences)
@@ -916,6 +977,9 @@ def fuse_obbs_from_csv(
     iou_threshold: float = 0.3,
     min_detections: int = 4,
     conf_threshold: float = 0.55,
+    extent_method: str = "mean",
+    envelope_quantile: float = 0.4,
+    envelope_padding_m: float = 0.03,
 ) -> list[FusedInstance]:
     """
     Load OBBs from a CSV file, fuse them, and save the results.
@@ -926,6 +990,9 @@ def fuse_obbs_from_csv(
         iou_threshold: IoU threshold for 3D box fusion
         min_detections: Minimum number of detections required to create an instance
         conf_threshold: Minimum confidence threshold to filter detections
+        extent_method: Fused extent estimator (``mean`` or ``robust_envelope``)
+        envelope_quantile: Trim quantile for robust lower/upper box faces
+        envelope_padding_m: Padding added to each robust-envelope face
 
     Returns:
         List of fused instances
@@ -956,6 +1023,9 @@ def fuse_obbs_from_csv(
         iou_threshold=iou_threshold,
         min_detections=min_detections,
         conf_threshold=conf_threshold,
+        extent_method=extent_method,
+        envelope_quantile=envelope_quantile,
+        envelope_padding_m=envelope_padding_m,
     )
     fused_instances = fuser.fuse(all_obbs)
     print(f"==> Fused into {len(fused_instances)} static instances")
@@ -1025,6 +1095,24 @@ def main() -> None:
         default=0.55,
         help="Minimum confidence threshold to filter detections (default: 0.55)",
     )
+    parser.add_argument(
+        "--extent-method",
+        choices=("mean", "robust_envelope"),
+        default="mean",
+        help="How to calculate fused box extents (default: mean)",
+    )
+    parser.add_argument(
+        "--envelope-quantile",
+        type=float,
+        default=0.4,
+        help="Robust-envelope trim quantile in [0, 0.5] (default: 0.4)",
+    )
+    parser.add_argument(
+        "--envelope-padding-m",
+        type=float,
+        default=0.03,
+        help="Padding added to each robust-envelope face in metres (default: 0.03)",
+    )
     args = parser.parse_args()
 
     fuse_obbs_from_csv(
@@ -1033,6 +1121,9 @@ def main() -> None:
         iou_threshold=args.iou,
         min_detections=args.min_detections,
         conf_threshold=args.conf_threshold,
+        extent_method=args.extent_method,
+        envelope_quantile=args.envelope_quantile,
+        envelope_padding_m=args.envelope_padding_m,
     )
 
 

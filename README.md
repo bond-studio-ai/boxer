@@ -48,6 +48,7 @@ In this repo, we provide sample code for running on the following data sources:
 * CA-1M
 * SUN-RGBD
 * ScanNet (manual download needed)
+* Timestamped MP4 + aligned PLY reconstructions
 
 Let's first start with Aria data. We host three sample [Project Aria](https://www.projectaria.com/) sequences (hohen_gen1, nym10_gen1, cook0_gen2) on [HuggingFace](https://huggingface.co/datasets/facebook/boxer). Download them to the `sample_data/` directory:
 
@@ -149,6 +150,23 @@ python view_prompt.py --input scene0707_00
 ```
 
 ![ScanNet Prompt](docs/images/scannet_screenshot.jpg)
+
+## Timestamped video + aligned point cloud
+
+A sequence directory can be passed directly when it contains `video.mp4`,
+`aligned.ply`, and `output_poses_registered_with_intrinsics.txt`. Pose rows use:
+
+```
+frame x y z qx qy qz qw fx fy cx cy width height timestamp
+```
+
+The loader seeks the video using `timestamp` (the `frame` column is ignored),
+scales the per-row intrinsics to the decoded image, and samples the large binary
+PLY without loading the full cloud into memory.
+
+```bash
+python run_boxer.py --input /path/to/sequence --labels=tub,vanity,toilet --fuse
+```
 
 ## run_boxer.py Usage Details
 

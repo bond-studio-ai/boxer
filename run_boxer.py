@@ -19,6 +19,7 @@ from boxernet.boxernet import BoxerNet
 from loaders.ca_loader import CALoader
 from loaders.omni_loader import OMNI3D_DATASETS, OmniLoader
 from loaders.scannet_loader import ScanNetLoader
+from loaders.video_ply_loader import VideoPlyLoader
 from utils.demo_utils import (
     CKPT_PATH,
     DEFAULT_BOXERNET_CKPT,
@@ -50,7 +51,9 @@ def jet_colors_bgr(scores):
     """Vectorized: map array of scores in [0,1] to list of BGR (int) tuples."""
     if len(scores) == 0:
         return []
-    vals = np.clip(np.array(scores, dtype=np.float32), 0.0, 1.0)
+    if isinstance(scores, torch.Tensor):
+        scores = scores.detach().cpu().numpy()
+    vals = np.clip(np.asarray(scores, dtype=np.float32), 0.0, 1.0)
     u8 = (vals * 255).astype(np.uint8).reshape(1, -1)
     bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)[0]  # (N, 3)
     return [tuple(int(c) for c in row) for row in bgr]
@@ -140,7 +143,18 @@ def main():
         _t_prev = now
 
     # Determine dataset type and seq_name from input string
-    if bool(re.search(r"scene\d{4}_\d{2}", args.input)) or "/scannet/" in args.input:
+    is_video_ply = all(
+        os.path.isfile(os.path.join(args.input, name))
+        for name in (
+            "video.mp4",
+            "aligned.ply",
+            "output_poses_registered_with_intrinsics.txt",
+        )
+    )
+    if is_video_ply:
+        dataset_type = "video_ply"
+        seq_name = os.path.basename(args.input.rstrip("/"))
+    elif bool(re.search(r"scene\d{4}_\d{2}", args.input)) or "/scannet/" in args.input:
         dataset_type = "scannet"
         seq_name = os.path.basename(args.input.rstrip("/"))
     elif args.input in OMNI3D_DATASETS:
@@ -195,7 +209,14 @@ def main():
         return
 
     # Create data loader
-    if dataset_type == "scannet":
+    if dataset_type == "video_ply":
+        loader = VideoPlyLoader(
+            sequence_dir=args.input,
+            skip_frames=args.skip_n,
+            max_frames=args.max_n,
+            start_frame=args.start_n,
+        )
+    elif dataset_type == "scannet":
         loader = ScanNetLoader(
             scene_dir=args.input,
             annotation_path=os.path.join(
@@ -342,6 +363,7 @@ def main():
         sem_id_to_name = {v: k for k, v in sem_name_to_id.items()}
 
     writer = None if args.no_csv else ObbCsvWriter2(csv_path)
+    has_written_2d = False
 
     tracker = None
     if args.track:
@@ -506,8 +528,8 @@ def main():
             precision_dtype = torch.bfloat16
         else:
             precision_dtype = torch.float32
-        # MPS does not support torch.autocast
-        if device == "mps":
+        # CPU float32 and MPS do not benefit from this CUDA autocast path.
+        if device != "cuda":
             outputs = boxernet.forward(datum)
         else:
             with torch.autocast(device_type=device, dtype=precision_dtype):
@@ -561,7 +583,7 @@ def main():
                 scores=scores2d,
                 labels=labels2d,
                 sem_name_to_id=sem_name_to_id,
-                append=(ii > 0),
+                append=has_written_2d,
                 time_ns=time_ns,
                 img_width=WW,
                 img_height=HH,
@@ -570,6 +592,7 @@ def main():
                 if hasattr(loader, "device_name")
                 else "unknown",
             )
+            has_written_2d = True
         t_csv = timer.stop("csv")
 
         active_tracks = None
