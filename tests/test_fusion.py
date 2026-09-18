@@ -634,6 +634,26 @@ class TestBoundingBox3DFuser(unittest.TestCase):
         instances = fuser.fuse(detections)
         self.assertEqual(len(instances), 0)
 
+    def test_shower_fixture_uses_lower_conf_threshold(self):
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            conf_threshold=0.55,
+            shower_fixture_conf_threshold=0.4,
+        )
+        detections = torch.stack(
+            [
+                _make_test_obb(
+                    [0.0, 0.0, 0.5], prob=0.45, text="shower fixture"
+                ),
+                _make_test_obb([5.0, 0.0, 0.5], prob=0.45, text="toilet"),
+            ]
+        )
+
+        instances = fuser.fuse(detections)
+
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].obb.text_string(), "shower fixture")
+
 
 # =============================================================================
 # Rotation matrix / yaw round-trip tests

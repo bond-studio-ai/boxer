@@ -4,6 +4,7 @@
 
 """Loader for a video, timestamped camera poses, and an aligned PLY cloud."""
 
+import json
 import os
 
 import cv2
@@ -110,6 +111,83 @@ def _quaternion_xyzw_to_matrix(q: np.ndarray) -> np.ndarray:
     )
 
 
+def _load_poses_with_nearest_intrinsics(
+    pose_path: str,
+    arkit_pose_path: str,
+    fps: float = 2.0,
+    max_time_delta_s: float = 0.05,
+) -> tuple[np.ndarray, list[dict], np.ndarray]:
+    """Load registered poses and pair them with the nearest ARKit calibration."""
+    if fps <= 0.0:
+        raise ValueError("fps must be positive")
+    if max_time_delta_s < 0.0:
+        raise ValueError("max_time_delta_s must be nonnegative")
+
+    pose_rows = np.atleast_2d(
+        np.loadtxt(pose_path, comments="#", dtype=np.float64)
+    )
+    if pose_rows.shape[1] != 8:
+        raise ValueError(f"Expected 8 pose columns, found {pose_rows.shape[1]}")
+
+    with open(arkit_pose_path, encoding="utf-8") as source:
+        payload = json.load(source)
+    samples = payload.get("data", payload) if isinstance(payload, dict) else payload
+    samples = list(samples.values()) if isinstance(samples, dict) else list(samples)
+    samples = [
+        sample
+        for sample in samples
+        if "timestamp" in sample
+        and len(sample.get("cameraIntrinsics", ())) >= 8
+        and "cameraResolution" in sample
+    ]
+    if not samples:
+        raise ValueError(f"No calibrated ARKit samples found in {arkit_pose_path}")
+    samples.sort(key=lambda sample: float(sample["timestamp"]))
+    sample_times = np.asarray(
+        [float(sample["timestamp"]) for sample in samples], dtype=np.float64
+    )
+
+    pose_times = pose_rows[:, 0] / fps
+    right = np.searchsorted(sample_times, pose_times, side="left")
+    right = np.clip(right, 0, len(sample_times) - 1)
+    left = np.maximum(right - 1, 0)
+    nearest = np.where(
+        np.abs(sample_times[left] - pose_times)
+        <= np.abs(sample_times[right] - pose_times),
+        left,
+        right,
+    )
+    deltas = np.abs(sample_times[nearest] - pose_times)
+    keep = deltas <= max_time_delta_s + 1e-12
+    return (
+        pose_rows[keep],
+        [samples[index] for index in nearest[keep]],
+        deltas[keep],
+    )
+
+
+def _intrinsics_for_display_orientation(
+    sample: dict, decoded_width: int, decoded_height: int
+) -> tuple[float, float, float, float, float, float]:
+    """Orient an ARKit calibration like the auto-rotated decoded video."""
+    intrinsics = sample["cameraIntrinsics"]
+    resolution = sample["cameraResolution"]
+    source_width = float(resolution["width"])
+    source_height = float(resolution["height"])
+    fx = float(intrinsics[0])
+    fy = float(intrinsics[4])
+    cx = float(intrinsics[6])
+    cy = float(intrinsics[7])
+
+    source_landscape = source_width > source_height
+    decoded_landscape = decoded_width > decoded_height
+    if source_landscape != decoded_landscape:
+        fx, fy = fy, fx
+        cx, cy = cy, cx
+        source_width, source_height = source_height, source_width
+    return fx, fy, cx, cy, source_width, source_height
+
+
 class VideoPlyLoader(BaseLoader):
     """Read frames at pose timestamps and reuse an aligned world point cloud."""
 
@@ -120,26 +198,41 @@ class VideoPlyLoader(BaseLoader):
         max_frames: int | None = None,
         start_frame: int = 1,
         max_cloud_points: int = 250_000,
+        fps: float = 2.0,
+        max_intrinsics_delta_s: float = 0.05,
     ):
         self.sequence_dir = os.path.abspath(os.path.expanduser(sequence_dir))
         self.scene_id = os.path.basename(self.sequence_dir.rstrip("/"))
         self.video_path = os.path.join(self.sequence_dir, "video.mp4")
-        self.pose_path = os.path.join(
-            self.sequence_dir, "output_poses_registered_with_intrinsics.txt"
-        )
+        self.pose_path = os.path.join(self.sequence_dir, "output_poses_registered.txt")
+        self.arkit_pose_path = os.path.join(self.sequence_dir, "arkit_poses.json")
         self.cloud_path = os.path.join(self.sequence_dir, "aligned.ply")
-        for path in (self.video_path, self.pose_path, self.cloud_path):
+        for path in (
+            self.video_path,
+            self.pose_path,
+            self.arkit_pose_path,
+            self.cloud_path,
+        ):
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
 
-        rows = np.loadtxt(self.pose_path, comments="#", dtype=np.float64)
-        rows = np.atleast_2d(rows)
-        if rows.shape[1] != 15:
-            raise ValueError(f"Expected 15 pose columns, found {rows.shape[1]}")
+        rows, intrinsics_samples, intrinsics_deltas = _load_poses_with_nearest_intrinsics(
+            self.pose_path,
+            self.arkit_pose_path,
+            fps=fps,
+            max_time_delta_s=max_intrinsics_delta_s,
+        )
         rows = rows[start_frame - 1 :: skip_frames]
+        intrinsics_samples = intrinsics_samples[start_frame - 1 :: skip_frames]
+        intrinsics_deltas = intrinsics_deltas[start_frame - 1 :: skip_frames]
         if max_frames is not None:
             rows = rows[:max_frames]
+            intrinsics_samples = intrinsics_samples[:max_frames]
+            intrinsics_deltas = intrinsics_deltas[:max_frames]
         self.rows = rows
+        self.intrinsics_samples = intrinsics_samples
+        self.intrinsics_deltas = intrinsics_deltas
+        self.fps = float(fps)
         self.length = len(rows)
         self.index = 0
         self.resize = None
@@ -163,29 +256,15 @@ class VideoPlyLoader(BaseLoader):
         print(
             f"VideoPlyLoader: {self.scene_id}, {self.length} timestamps, "
             f"{len(self.sdp_w)} sampled cloud points, "
-            f"decoded {self.decoded_width}x{self.decoded_height}"
+            f"decoded {self.decoded_width}x{self.decoded_height}, "
+            f"maximum intrinsics offset {self.intrinsics_deltas.max(initial=0.0) * 1000:.1f}ms"
         )
         self._init_prefetch()
 
     def load(self, idx):
         row = self.rows[idx]
-        (
-            _source_frame,
-            x,
-            y,
-            z,
-            qx,
-            qy,
-            qz,
-            qw,
-            fx,
-            fy,
-            cx,
-            cy,
-            calib_width,
-            calib_height,
-            timestamp_s,
-        ) = row
+        source_frame, x, y, z, qx, qy, qz, qw = row
+        timestamp_s = source_frame / self.fps
 
         cap = cv2.VideoCapture(self.video_path)
         cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
@@ -199,13 +278,11 @@ class VideoPlyLoader(BaseLoader):
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         height, width = image_rgb.shape[:2]
 
-        # If a decoder ignored the display matrix, restore the portrait layout
-        # expected by the calibration rows.
-        expected_portrait = calib_height > calib_width
-        if expected_portrait and width > height:
-            image_rgb = cv2.rotate(image_rgb, cv2.ROTATE_90_CLOCKWISE)
-            height, width = image_rgb.shape[:2]
-
+        fx, fy, cx, cy, calib_width, calib_height = (
+            _intrinsics_for_display_orientation(
+                self.intrinsics_samples[idx], width, height
+            )
+        )
         scale_x = width / calib_width
         scale_y = height / calib_height
         fx, fy = fx * scale_x, fy * scale_y

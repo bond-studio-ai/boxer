@@ -1302,6 +1302,7 @@ class OBBViewer(OrbitViewer):
                     "(valid: pca, prob, random)"
                 )
         self.prob_threshold = 0.55  # Probability threshold for filtering
+        self.shower_fixture_prob_threshold = 0.4
         self.root_path = root_path  # Root path for saving results
         self.seq_name = seq_name  # Sequence name for boxy_data lookup
         if timed_obbs is not None:
@@ -1782,7 +1783,18 @@ class OBBViewer(OrbitViewer):
             return self._cached_filtered_obbs, self._cached_filtered_indices
 
         # Filter using vectorized tensor operation (much faster than Python loops!)
-        mask = (self.all_obbs.prob >= self.prob_threshold).reshape(-1)
+        labels = self.all_obbs.text_string()
+        thresholds = torch.tensor(
+            [
+                self.shower_fixture_prob_threshold
+                if label == "shower fixture"
+                else self.prob_threshold
+                for label in labels
+            ],
+            dtype=self.all_obbs.prob.dtype,
+            device=self.all_obbs.prob.device,
+        )
+        mask = self.all_obbs.prob.reshape(-1) >= thresholds
         filtered_obbs = self.all_obbs[mask]
         indices = torch.where(mask)[0]  # Get actual indices
 

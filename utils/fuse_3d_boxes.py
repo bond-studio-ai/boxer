@@ -341,9 +341,10 @@ class BoundingBox3DFuser:
         enable_nms: bool = False,
         nms_iou_threshold: float = 0.6,
         conf_threshold: float = 0.55,
+        shower_fixture_conf_threshold: float = 0.4,
         extent_method: str = "mean",
         envelope_quantile: float = 0.4,
-        envelope_padding_m: float = 0.03,
+        envelope_padding_m: float = 0.0,
         extent_iou_threshold: float = 0.1,
         face_min_support: int = 3,
         face_tolerance_m: float = 0.15,
@@ -359,6 +360,8 @@ class BoundingBox3DFuser:
             enable_nms: If True, apply NMS to fused boxes with high IoU and semantic similarity
             nms_iou_threshold: IoU threshold for NMS (boxes with IoU > this are redundant)
             conf_threshold: Minimum confidence threshold to keep detections (default: 0.55)
+            shower_fixture_conf_threshold: Confidence threshold used only for
+                shower-fixture detections (default: 0.4)
             extent_method: ``mean`` for the original size average, or
                 ``robust_envelope`` to estimate lower/upper faces independently
             envelope_quantile: Robust-envelope trim quantile in [0, 0.5]
@@ -376,6 +379,9 @@ class BoundingBox3DFuser:
         self.enable_nms = enable_nms
         self.nms_iou_threshold = nms_iou_threshold
         self.conf_threshold = conf_threshold
+        self.shower_fixture_conf_threshold = shower_fixture_conf_threshold
+        if not 0.0 <= shower_fixture_conf_threshold <= 1.0:
+            raise ValueError("shower_fixture_conf_threshold must be in [0, 1]")
         if extent_method not in ("mean", "robust_envelope", "consensus_envelope"):
             raise ValueError(f"Unknown extent method: {extent_method}")
         if not 0.0 <= envelope_quantile <= 0.5:
@@ -426,8 +432,19 @@ class BoundingBox3DFuser:
             raise ValueError("detection_group_ids must have shape (N,)")
 
         # Step 0: Filter by confidence threshold
-        if self.conf_threshold > 0:
-            conf_mask = detections.prob.squeeze() >= self.conf_threshold
+        if self.conf_threshold > 0 or self.shower_fixture_conf_threshold > 0:
+            labels = detections.text_string()
+            thresholds = torch.tensor(
+                [
+                    self.shower_fixture_conf_threshold
+                    if label == "shower fixture"
+                    else self.conf_threshold
+                    for label in labels
+                ],
+                dtype=detections.prob.dtype,
+                device=detections.prob.device,
+            )
+            conf_mask = detections.prob.reshape(-1) >= thresholds
             n_before = n
             detections = detections[conf_mask]
             detection_group_ids = detection_group_ids[conf_mask]
@@ -435,7 +452,9 @@ class BoundingBox3DFuser:
                 semantic_embeddings = semantic_embeddings[conf_mask]
             n = detections.shape[0]
             print(
-                f"Filtered {n_before - n} detections below conf_threshold={self.conf_threshold} "
+                f"Filtered {n_before - n} detections below confidence thresholds "
+                f"(default={self.conf_threshold}, shower fixture="
+                f"{self.shower_fixture_conf_threshold}) "
                 f"({n_before} -> {n})"
             )
             if n == 0:
@@ -1118,9 +1137,10 @@ def fuse_obbs_from_csv(
     iou_threshold: float = 0.3,
     min_detections: int = 4,
     conf_threshold: float = 0.55,
+    shower_fixture_conf_threshold: float = 0.4,
     extent_method: str = "mean",
     envelope_quantile: float = 0.4,
-    envelope_padding_m: float = 0.03,
+    envelope_padding_m: float = 0.0,
     extent_iou_threshold: float = 0.1,
     face_min_support: int = 3,
     face_tolerance_m: float = 0.15,
@@ -1134,6 +1154,8 @@ def fuse_obbs_from_csv(
         iou_threshold: IoU threshold for 3D box fusion
         min_detections: Minimum number of detections required to create an instance
         conf_threshold: Minimum confidence threshold to filter detections
+        shower_fixture_conf_threshold: Confidence threshold used only for
+            shower-fixture detections
         extent_method: Fused extent estimator (``mean`` or ``robust_envelope``)
         envelope_quantile: Trim quantile for robust lower/upper box faces
         envelope_padding_m: Padding added to each robust-envelope face
@@ -1173,6 +1195,7 @@ def fuse_obbs_from_csv(
         iou_threshold=iou_threshold,
         min_detections=min_detections,
         conf_threshold=conf_threshold,
+        shower_fixture_conf_threshold=shower_fixture_conf_threshold,
         extent_method=extent_method,
         envelope_quantile=envelope_quantile,
         envelope_padding_m=envelope_padding_m,
@@ -1249,6 +1272,12 @@ def main() -> None:
         help="Minimum confidence threshold to filter detections (default: 0.55)",
     )
     parser.add_argument(
+        "--shower-fixture-conf-threshold",
+        type=float,
+        default=0.4,
+        help="Confidence threshold used only for shower fixtures (default: 0.4)",
+    )
+    parser.add_argument(
         "--extent-method",
         choices=("mean", "robust_envelope", "consensus_envelope"),
         default="mean",
@@ -1263,8 +1292,8 @@ def main() -> None:
     parser.add_argument(
         "--envelope-padding-m",
         type=float,
-        default=0.03,
-        help="Padding added to each robust-envelope face in metres (default: 0.03)",
+        default=0.0,
+        help="Padding added to each robust-envelope face in metres (default: 0.0)",
     )
     parser.add_argument(
         "--extent-iou-threshold",
@@ -1292,6 +1321,7 @@ def main() -> None:
         iou_threshold=args.iou,
         min_detections=args.min_detections,
         conf_threshold=args.conf_threshold,
+        shower_fixture_conf_threshold=args.shower_fixture_conf_threshold,
         extent_method=args.extent_method,
         envelope_quantile=args.envelope_quantile,
         envelope_padding_m=args.envelope_padding_m,

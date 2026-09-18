@@ -97,6 +97,7 @@ def main():
     parser.add_argument("--skip_n", type=int, default=1, help="skip n frames")
     parser.add_argument("--start_n", type=int, default=1, help="start from n-th frame")
     parser.add_argument("--max_n", type=int, default=99999, help="run for max n frames")
+    parser.add_argument("--video_fps", type=float, default=2.0, help="FPS used to convert registered pose frame numbers to timestamps (default: 2)")
     parser.add_argument("--pinhole", action="store_true", help="rectify to pinhole")
     parser.add_argument("--camera", type=str, default="rgb", choices=["rgb", "slaml", "slamr"], help="camera to use (default: rgb)")
     parser.add_argument("--detector", type=str, default="owl", choices=["owl"], help="2D detector to use (default: owl)")
@@ -148,7 +149,8 @@ def main():
         for name in (
             "video.mp4",
             "aligned.ply",
-            "output_poses_registered_with_intrinsics.txt",
+            "output_poses_registered.txt",
+            "arkit_poses.json",
         )
     )
     if is_video_ply:
@@ -215,6 +217,7 @@ def main():
             skip_frames=args.skip_n,
             max_frames=args.max_n,
             start_frame=args.start_n,
+            fps=args.video_fps,
         )
     elif dataset_type == "scannet":
         loader = ScanNetLoader(
