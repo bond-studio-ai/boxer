@@ -11,7 +11,13 @@ from PIL import Image, ImageDraw
 
 
 LABELS = ("tub", "vanity", "toilet")
-COLORS = {"tub": "#31b7ff", "vanity": "#39d98a", "toilet": "#ff9f43"}
+COLORS = {
+    "tub": "#31b7ff",
+    "vanity": "#39d98a",
+    "toilet": "#ff9f43",
+    "shower": "#b084ff",
+    "shower fixture": "#ff66b3",
+}
 
 
 def _read_csv(path):
@@ -21,7 +27,7 @@ def _read_csv(path):
 
 def _best(rows, label):
     matches = [row for row in rows if row["name"] == label]
-    return max(matches, key=lambda row: float(row["prob"]))
+    return max(matches, key=lambda row: float(row["prob"])) if matches else None
 
 
 def _caption(image, text, height=34):
@@ -41,7 +47,13 @@ def _write_csv(path, rows, fieldnames):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output_root")
+    parser.add_argument(
+        "--labels",
+        default=",".join(LABELS),
+        help="Comma-separated labels to include",
+    )
     args = parser.parse_args()
+    labels = tuple(label.strip() for label in args.labels.split(",") if label.strip())
 
     sequence_dirs = sorted(glob.glob(os.path.join(args.output_root, "20260915_12*")))
     summary_dir = os.path.join(args.output_root, "summary")
@@ -57,46 +69,48 @@ def main():
         rows_3d = _read_csv(os.path.join(sequence_dir, "boxer_3dbbs.csv"))
         counts_2d = Counter(row["name"] for row in rows_2d)
         counts_3d = Counter(row["name"] for row in rows_3d)
-        best_2d = {label: _best(rows_2d, label) for label in LABELS}
-        best_3d = {label: _best(rows_3d, label) for label in LABELS}
+        best_2d = {label: _best(rows_2d, label) for label in labels}
+        best_3d = {label: _best(rows_3d, label) for label in labels}
         sequence_data.append((sequence, sequence_dir, best_2d))
 
-        for label in LABELS:
+        for label in labels:
             row_2d = best_2d[label]
-            best_2d_rows.append(
-                {
-                    "sequence": sequence,
-                    "object": label,
-                    "timestamp_s": f"{int(row_2d['time_ns']) / 1e9:.3f}",
-                    "sampled_frame": row_2d["frame_id"],
-                    "confidence": row_2d["prob"],
-                    "x1": row_2d["x1"],
-                    "y1": row_2d["y1"],
-                    "x2": row_2d["x2"],
-                    "y2": row_2d["y2"],
-                    "image_width": row_2d["img_width"],
-                    "image_height": row_2d["img_height"],
-                }
-            )
+            if row_2d is not None:
+                best_2d_rows.append(
+                    {
+                        "sequence": sequence,
+                        "object": label,
+                        "timestamp_s": f"{int(row_2d['time_ns']) / 1e9:.3f}",
+                        "sampled_frame": row_2d["frame_id"],
+                        "confidence": row_2d["prob"],
+                        "x1": row_2d["x1"],
+                        "y1": row_2d["y1"],
+                        "x2": row_2d["x2"],
+                        "y2": row_2d["y2"],
+                        "image_width": row_2d["img_width"],
+                        "image_height": row_2d["img_height"],
+                    }
+                )
             row_3d = best_3d[label]
-            best_3d_rows.append(
-                {
-                    "sequence": sequence,
-                    "object": label,
-                    "timestamp_s": f"{int(row_3d['time_ns']) / 1e9:.3f}",
-                    "confidence": row_3d["prob"],
-                    "center_x": row_3d["tx_world_object"],
-                    "center_y": row_3d["ty_world_object"],
-                    "center_z": row_3d["tz_world_object"],
-                    "size_x": row_3d["scale_x"],
-                    "size_y": row_3d["scale_y"],
-                    "size_z": row_3d["scale_z"],
-                    "qw": row_3d["qw_world_object"],
-                    "qx": row_3d["qx_world_object"],
-                    "qy": row_3d["qy_world_object"],
-                    "qz": row_3d["qz_world_object"],
-                }
-            )
+            if row_3d is not None:
+                best_3d_rows.append(
+                    {
+                        "sequence": sequence,
+                        "object": label,
+                        "timestamp_s": f"{int(row_3d['time_ns']) / 1e9:.3f}",
+                        "confidence": row_3d["prob"],
+                        "center_x": row_3d["tx_world_object"],
+                        "center_y": row_3d["ty_world_object"],
+                        "center_z": row_3d["tz_world_object"],
+                        "size_x": row_3d["scale_x"],
+                        "size_y": row_3d["scale_y"],
+                        "size_z": row_3d["scale_z"],
+                        "qw": row_3d["qw_world_object"],
+                        "qx": row_3d["qx_world_object"],
+                        "qy": row_3d["qy_world_object"],
+                        "qz": row_3d["qz_world_object"],
+                    }
+                )
             count_rows.append(
                 {
                     "sequence": sequence,
@@ -124,21 +138,25 @@ def main():
 
     tile_size = (480, 240)
     grid = Image.new(
-        "RGB", (tile_size[0] * len(LABELS), (tile_size[1] + 34) * len(sequence_data))
+        "RGB", (tile_size[0] * len(labels), (tile_size[1] + 34) * len(sequence_data))
     )
     for row_index, (sequence, sequence_dir, best_2d) in enumerate(sequence_data):
-        for column_index, label in enumerate(LABELS):
+        for column_index, label in enumerate(labels):
             detection = best_2d[label]
-            frame_id = int(detection["frame_id"])
-            path = os.path.join(
-                sequence_dir, "boxer_viz", f"boxer_viz_{frame_id:05d}.jpg"
-            )
-            image = Image.open(path).convert("RGB").resize(tile_size)
-            title = (
-                f"{sequence[9:15]}  {label}  "
-                f"p={float(detection['prob']):.2f}  "
-                f"t={int(detection['time_ns']) / 1e9:.1f}s"
-            )
+            if detection is None:
+                image = Image.new("RGB", tile_size, "#24282d")
+                title = f"{sequence[9:15]}  {label}  no detection"
+            else:
+                frame_id = int(detection["frame_id"])
+                path = os.path.join(
+                    sequence_dir, "boxer_viz", f"boxer_viz_{frame_id:05d}.jpg"
+                )
+                image = Image.open(path).convert("RGB").resize(tile_size)
+                title = (
+                    f"{sequence[9:15]}  {label}  "
+                    f"p={float(detection['prob']):.2f}  "
+                    f"t={int(detection['time_ns']) / 1e9:.1f}s"
+                )
             tile = _caption(image, title)
             grid.paste(
                 tile,
@@ -146,10 +164,12 @@ def main():
             )
     grid.save(os.path.join(summary_dir, "relevant_frames.jpg"), quality=92)
 
-    for label in LABELS:
+    for label in labels:
         tiles = []
         for sequence, sequence_dir, best_2d in sequence_data:
             detection = best_2d[label]
+            if detection is None:
+                continue
             frame_id = int(detection["frame_id"])
             path = os.path.join(
                 sequence_dir, "boxer_viz", f"boxer_viz_{frame_id:05d}.jpg"
@@ -176,17 +196,20 @@ def main():
                 int((x2 - crop_box[0]) * sx),
                 int((y2 - crop_box[1]) * sy),
             )
-            draw.rectangle(selected_box, outline=COLORS[label], width=5)
+            draw.rectangle(selected_box, outline=COLORS.get(label, "#ffffff"), width=5)
             tiles.append(
                 _caption(
                     crop,
                     f"{sequence[9:15]}  p={float(detection['prob']):.2f}",
                 )
             )
+        if not tiles:
+            continue
         sheet = Image.new("RGB", (320 * len(tiles), 354), "#16191d")
         for index, tile in enumerate(tiles):
             sheet.paste(tile, (index * 320, 0))
-        sheet.save(os.path.join(summary_dir, f"{label}_boxes.jpg"), quality=94)
+        safe_label = label.replace(" ", "_")
+        sheet.save(os.path.join(summary_dir, f"{safe_label}_boxes.jpg"), quality=94)
 
     print(f"Saved summaries to {summary_dir}")
 

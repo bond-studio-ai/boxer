@@ -131,6 +131,37 @@ def weighted_quantile(
     return torch.stack(outputs)
 
 
+def consensus_outer_face(
+    values: torch.Tensor,
+    group_ids: torch.Tensor,
+    *,
+    choose_lower: bool,
+    min_support: int,
+    tolerance_m: float,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """Estimate an outer face supported by multiple independent frames.
+
+    Multiple detections from one frame count once. Within a frame, the most
+    outward face is retained. The outermost face with ``min_support`` nearby
+    frame-level observations is returned as their median.
+    """
+    if values.ndim != 1 or group_ids.ndim != 1 or len(values) != len(group_ids):
+        raise ValueError("values and group_ids must be one-dimensional and aligned")
+
+    frame_values = []
+    for group_id in torch.unique(group_ids):
+        candidates = values[group_ids == group_id]
+        frame_values.append(candidates.min() if choose_lower else candidates.max())
+    frame_values = torch.stack(frame_values)
+    ordered = torch.sort(frame_values, descending=not choose_lower).values
+    for candidate in ordered:
+        nearby = frame_values[torch.abs(frame_values - candidate) <= tolerance_m]
+        if len(nearby) >= min_support:
+            return nearby.median()
+    return fallback
+
+
 def align_boxes_r90(
     sizes: torch.Tensor,
     yaw_angles: torch.Tensor,
@@ -313,6 +344,9 @@ class BoundingBox3DFuser:
         extent_method: str = "mean",
         envelope_quantile: float = 0.4,
         envelope_padding_m: float = 0.03,
+        extent_iou_threshold: float = 0.1,
+        face_min_support: int = 3,
+        face_tolerance_m: float = 0.15,
     ) -> None:
         """
         Initialize 3D box fusion system.
@@ -329,6 +363,10 @@ class BoundingBox3DFuser:
                 ``robust_envelope`` to estimate lower/upper faces independently
             envelope_quantile: Robust-envelope trim quantile in [0, 0.5]
             envelope_padding_m: Metric padding on every robust-envelope face
+            extent_iou_threshold: Relaxed IoU used to associate same-label
+                detections as extent-only evidence
+            face_min_support: Independent frames required to accept an outer face
+            face_tolerance_m: Maximum face-position difference for consensus
         """
         self.iou_threshold = iou_threshold
         self.min_detections = min_detections
@@ -338,18 +376,30 @@ class BoundingBox3DFuser:
         self.enable_nms = enable_nms
         self.nms_iou_threshold = nms_iou_threshold
         self.conf_threshold = conf_threshold
-        if extent_method not in ("mean", "robust_envelope"):
+        if extent_method not in ("mean", "robust_envelope", "consensus_envelope"):
             raise ValueError(f"Unknown extent method: {extent_method}")
         if not 0.0 <= envelope_quantile <= 0.5:
             raise ValueError("envelope_quantile must be in [0, 0.5]")
         if envelope_padding_m < 0.0:
             raise ValueError("envelope_padding_m must be nonnegative")
+        if not 0.0 <= extent_iou_threshold <= 1.0:
+            raise ValueError("extent_iou_threshold must be in [0, 1]")
+        if face_min_support < 1:
+            raise ValueError("face_min_support must be positive")
+        if face_tolerance_m < 0.0:
+            raise ValueError("face_tolerance_m must be nonnegative")
         self.extent_method = extent_method
         self.envelope_quantile = envelope_quantile
         self.envelope_padding_m = envelope_padding_m
+        self.extent_iou_threshold = extent_iou_threshold
+        self.face_min_support = face_min_support
+        self.face_tolerance_m = face_tolerance_m
 
     def fuse(
-        self, detections: ObbTW, semantic_embeddings: Optional[torch.Tensor] = None
+        self,
+        detections: ObbTW,
+        semantic_embeddings: Optional[torch.Tensor] = None,
+        detection_group_ids: Optional[torch.Tensor] = None,
     ) -> List[FusedInstance]:
         """
         Fuse ObbTW detections into static instances.
@@ -357,6 +407,7 @@ class BoundingBox3DFuser:
         Args:
             detections: ObbTW tensor of shape (N, 165) containing N detections
             semantic_embeddings: Optional tensor of shape (N, D) with normalized embeddings
+            detection_group_ids: Optional frame/timestamp ID for each detection
 
         Returns:
             List of fused instances
@@ -369,12 +420,17 @@ class BoundingBox3DFuser:
         n = detections.shape[0]
         if n == 0:
             return []
+        if detection_group_ids is None:
+            detection_group_ids = torch.arange(n)
+        elif detection_group_ids.shape != (n,):
+            raise ValueError("detection_group_ids must have shape (N,)")
 
         # Step 0: Filter by confidence threshold
         if self.conf_threshold > 0:
             conf_mask = detections.prob.squeeze() >= self.conf_threshold
             n_before = n
             detections = detections[conf_mask]
+            detection_group_ids = detection_group_ids[conf_mask]
             if semantic_embeddings is not None:
                 semantic_embeddings = semantic_embeddings[conf_mask]
             n = detections.shape[0]
@@ -454,7 +510,31 @@ class BoundingBox3DFuser:
         # Step 3: Fuse boxes within each cluster
         print("\n[3/4] Fusing clusters...")
         step3_start = time.time()
-        instances = self._fuse_clusters(detections, clusters)
+        extent_clusters = None
+        if self.extent_method == "consensus_envelope":
+            if iou_matrix.is_sparse:
+                print("  Consensus extent association unavailable for sparse IoU; using primary clusters")
+                extent_clusters = clusters
+            else:
+                labels = detections.text_string()
+                extent_clusters = []
+                for cluster in clusters:
+                    cluster_labels = [labels[index] for index in cluster]
+                    label = max(set(cluster_labels), key=cluster_labels.count)
+                    overlap = iou_matrix[:, cluster].max(dim=1).values
+                    candidates = [
+                        index
+                        for index in range(n)
+                        if labels[index] == label
+                        and float(overlap[index]) >= self.extent_iou_threshold
+                    ]
+                    extent_clusters.append(sorted(set(cluster) | set(candidates)))
+        instances = self._fuse_clusters(
+            detections,
+            clusters,
+            extent_clusters=extent_clusters,
+            detection_group_ids=detection_group_ids,
+        )
         step3_time = time.time() - step3_start
         print(f"  ✓ Fused {len(instances)} instances: {step3_time:.3f}s")
 
@@ -616,7 +696,11 @@ class BoundingBox3DFuser:
         return clusters
 
     def _fuse_clusters(
-        self, detections: ObbTW, clusters: list[list[int]]
+        self,
+        detections: ObbTW,
+        clusters: list[list[int]],
+        extent_clusters: Optional[list[list[int]]] = None,
+        detection_group_ids: Optional[torch.Tensor] = None,
     ) -> list[FusedInstance]:
         """
         Fuse detections within each cluster into single instances.
@@ -633,7 +717,12 @@ class BoundingBox3DFuser:
         """
         instances = []
 
-        for cluster in clusters:
+        if extent_clusters is None:
+            extent_clusters = clusters
+        if detection_group_ids is None:
+            detection_group_ids = torch.arange(len(detections))
+
+        for cluster_index, cluster in enumerate(clusters):
             cluster_detections = detections[cluster]  # (M, 165)
 
             # Extract sizes and yaw angles
@@ -678,20 +767,72 @@ class BoundingBox3DFuser:
             # every contributing box into the fused orientation and estimates
             # its lower and upper faces independently. This avoids shrinking a
             # long object when partial detections have shifted centers.
-            if self.extent_method == "robust_envelope":
-                corners_world = cluster_detections.bb3corners_world
+            if self.extent_method in ("robust_envelope", "consensus_envelope"):
+                extent_indices = extent_clusters[cluster_index]
+                extent_detections = detections[extent_indices]
+                corners_world = extent_detections.bb3corners_world
                 corners_local = torch.matmul(
                     corners_world - fused_translation.view(1, 1, 3),
                     fused_rotation,
                 )
                 lower_faces = corners_local.min(dim=1).values
                 upper_faces = corners_local.max(dim=1).values
-                lower = weighted_quantile(
-                    lower_faces, weights, self.envelope_quantile
-                ) - self.envelope_padding_m
-                upper = weighted_quantile(
-                    upper_faces, weights, 1.0 - self.envelope_quantile
-                ) + self.envelope_padding_m
+                if self.extent_method == "consensus_envelope":
+                    primary_corners_world = cluster_detections.bb3corners_world
+                    primary_corners_local = torch.matmul(
+                        primary_corners_world - fused_translation.view(1, 1, 3),
+                        fused_rotation,
+                    )
+                    primary_lower = primary_corners_local.min(dim=1).values
+                    primary_upper = primary_corners_local.max(dim=1).values
+                    fallback_lower = weighted_quantile(
+                        primary_lower, weights, self.envelope_quantile
+                    )
+                    fallback_upper = weighted_quantile(
+                        primary_upper, weights, 1.0 - self.envelope_quantile
+                    )
+                    extent_group_ids = detection_group_ids[extent_indices]
+                    # Consensus expansion is intentionally limited to the
+                    # dominant object axis. Applying outer-face evidence to
+                    # depth and height can absorb walls, counters, or floors
+                    # when the 3D center is noisy across viewpoints.
+                    major_axis = int(
+                        torch.argmax(fallback_upper - fallback_lower).item()
+                    )
+                    lower = fallback_lower.clone()
+                    upper = fallback_upper.clone()
+                    consensus_lower = consensus_outer_face(
+                        lower_faces[:, major_axis],
+                        extent_group_ids,
+                        choose_lower=True,
+                        min_support=self.face_min_support,
+                        tolerance_m=self.face_tolerance_m,
+                        fallback=fallback_lower[major_axis],
+                    )
+                    consensus_upper = consensus_outer_face(
+                        upper_faces[:, major_axis],
+                        extent_group_ids,
+                        choose_lower=False,
+                        min_support=self.face_min_support,
+                        tolerance_m=self.face_tolerance_m,
+                        fallback=fallback_upper[major_axis],
+                    )
+                    # Consensus may expand the robust envelope, never shrink it.
+                    lower[major_axis] = torch.minimum(
+                        consensus_lower, fallback_lower[major_axis]
+                    )
+                    upper[major_axis] = torch.maximum(
+                        consensus_upper, fallback_upper[major_axis]
+                    )
+                else:
+                    lower = weighted_quantile(
+                        lower_faces, weights, self.envelope_quantile
+                    )
+                    upper = weighted_quantile(
+                        upper_faces, weights, 1.0 - self.envelope_quantile
+                    )
+                lower = lower - self.envelope_padding_m
+                upper = upper + self.envelope_padding_m
                 fused_sizes = (upper - lower).clamp_min(1e-4)
                 local_center = 0.5 * (lower + upper)
                 fused_translation = fused_translation + torch.matmul(
@@ -980,6 +1121,9 @@ def fuse_obbs_from_csv(
     extent_method: str = "mean",
     envelope_quantile: float = 0.4,
     envelope_padding_m: float = 0.03,
+    extent_iou_threshold: float = 0.1,
+    face_min_support: int = 3,
+    face_tolerance_m: float = 0.15,
 ) -> list[FusedInstance]:
     """
     Load OBBs from a CSV file, fuse them, and save the results.
@@ -993,6 +1137,9 @@ def fuse_obbs_from_csv(
         extent_method: Fused extent estimator (``mean`` or ``robust_envelope``)
         envelope_quantile: Trim quantile for robust lower/upper box faces
         envelope_padding_m: Padding added to each robust-envelope face
+        extent_iou_threshold: Relaxed same-label overlap for extent evidence
+        face_min_support: Independent timestamps required per outer face
+        face_tolerance_m: Face consensus tolerance in metres
 
     Returns:
         List of fused instances
@@ -1012,6 +1159,9 @@ def fuse_obbs_from_csv(
     # Concatenate all OBBs from all timestamps
     all_obbs_list = list(timed_obbs.values())
     all_obbs = torch.cat(all_obbs_list, dim=0)
+    detection_group_ids = torch.cat(
+        [torch.full((len(obbs),), index, dtype=torch.long) for index, obbs in enumerate(all_obbs_list)]
+    )
     print(f"==> Loaded {all_obbs.shape[0]} OBBs from {len(timed_obbs)} timestamps")
 
     # Create fuser and run fusion
@@ -1026,8 +1176,11 @@ def fuse_obbs_from_csv(
         extent_method=extent_method,
         envelope_quantile=envelope_quantile,
         envelope_padding_m=envelope_padding_m,
+        extent_iou_threshold=extent_iou_threshold,
+        face_min_support=face_min_support,
+        face_tolerance_m=face_tolerance_m,
     )
-    fused_instances = fuser.fuse(all_obbs)
+    fused_instances = fuser.fuse(all_obbs, detection_group_ids=detection_group_ids)
     print(f"==> Fused into {len(fused_instances)} static instances")
 
     if len(fused_instances) == 0:
@@ -1097,7 +1250,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--extent-method",
-        choices=("mean", "robust_envelope"),
+        choices=("mean", "robust_envelope", "consensus_envelope"),
         default="mean",
         help="How to calculate fused box extents (default: mean)",
     )
@@ -1113,6 +1266,24 @@ def main() -> None:
         default=0.03,
         help="Padding added to each robust-envelope face in metres (default: 0.03)",
     )
+    parser.add_argument(
+        "--extent-iou-threshold",
+        type=float,
+        default=0.1,
+        help="Relaxed same-label IoU for extent-only evidence (default: 0.1)",
+    )
+    parser.add_argument(
+        "--face-min-support",
+        type=int,
+        default=3,
+        help="Independent timestamps required to accept an outer face (default: 3)",
+    )
+    parser.add_argument(
+        "--face-tolerance-m",
+        type=float,
+        default=0.15,
+        help="Face consensus tolerance in metres (default: 0.15)",
+    )
     args = parser.parse_args()
 
     fuse_obbs_from_csv(
@@ -1124,6 +1295,9 @@ def main() -> None:
         extent_method=args.extent_method,
         envelope_quantile=args.envelope_quantile,
         envelope_padding_m=args.envelope_padding_m,
+        extent_iou_threshold=args.extent_iou_threshold,
+        face_min_support=args.face_min_support,
+        face_tolerance_m=args.face_tolerance_m,
     )
 
 

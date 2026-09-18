@@ -545,6 +545,71 @@ class TestBoundingBox3DFuser(unittest.TestCase):
         self.assertLessEqual(center_x - extent_x / 2.0, -1.02)
         self.assertGreaterEqual(center_x + extent_x / 2.0, 1.02)
 
+    def test_consensus_envelope_uses_repeated_extent_only_evidence(self):
+        """Three secondary frames can restore a face missing from the primary cluster."""
+        partial = [
+            _make_test_obb([0.5, 0.0, 0.5], sz=(1.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        full = [
+            _make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        detections = torch.stack(partial + full)
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            confidence_weighting="uniform",
+            conf_threshold=0.0,
+            extent_method="consensus_envelope",
+            envelope_padding_m=0.03,
+            face_min_support=3,
+            face_tolerance_m=0.15,
+        )
+
+        instance = fuser._fuse_clusters(
+            detections,
+            [list(range(3))],
+            extent_clusters=[list(range(6))],
+            detection_group_ids=torch.arange(6),
+        )[0]
+        center_x = float(instance.obb.T_world_object.t[0])
+        extent_x = float(instance.obb.bb3_object[1] - instance.obb.bb3_object[0])
+
+        self.assertLessEqual(center_x - extent_x / 2.0, -1.02)
+        self.assertGreaterEqual(center_x + extent_x / 2.0, 1.02)
+
+    def test_consensus_envelope_counts_each_frame_once(self):
+        """Duplicate detections from one frame cannot satisfy face support alone."""
+        partial = [
+            _make_test_obb([0.5, 0.0, 0.5], sz=(1.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        duplicate_full = [
+            _make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        detections = torch.stack(partial + duplicate_full)
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            confidence_weighting="uniform",
+            conf_threshold=0.0,
+            extent_method="consensus_envelope",
+            envelope_quantile=0.4,
+            envelope_padding_m=0.0,
+            face_min_support=3,
+        )
+
+        instance = fuser._fuse_clusters(
+            detections,
+            [list(range(3))],
+            extent_clusters=[list(range(6))],
+            detection_group_ids=torch.tensor([0, 1, 2, 3, 3, 3]),
+        )[0]
+        center_x = float(instance.obb.T_world_object.t[0])
+        extent_x = float(instance.obb.bb3_object[1] - instance.obb.bb3_object[0])
+
+        self.assertGreater(center_x - extent_x / 2.0, -0.5)
+
     def test_empty_detections(self):
         """Empty input should return empty list."""
         fuser = BoundingBox3DFuser(min_detections=1, conf_threshold=0.0)
