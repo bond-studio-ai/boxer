@@ -118,6 +118,20 @@ def main():
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
     parser.add_argument("--gt2d", action="store_true", help="use GT pseudo 2DBB as input")
     parser.add_argument("--fuse", action="store_true", help="run offline 3D box fusion and save spatiallm_bboxes.txt after processing")
+    parser.add_argument(
+        "--extent-method",
+        dest="extent_method",
+        choices=("mean", "robust_envelope", "consensus_envelope"),
+        default="mean",
+        help="How to calculate fused box extents (default: mean)",
+    )
+    parser.add_argument(
+        "--envelope-padding-m",
+        dest="envelope_padding_m",
+        type=float,
+        default=0.0,
+        help="Padding added to each robust-envelope face in metres (default: 0.0)",
+    )
     parser.add_argument("--track", action="store_true", help="run online 3D box tracking and show tracked boxes in Top Down View")
     parser.add_argument("--ckpt", type=str, default=os.path.join(CKPT_PATH, DEFAULT_BOXERNET_CKPT), help="path to BoxerNet checkpoint")
     parser.add_argument("--force_precision", type=str, default=None, choices=["float32", "bfloat16"], help="Override auto-detected inference precision")
@@ -231,7 +245,11 @@ def main():
             from utils.fuse_3d_boxes import fuse_obbs_from_csv
 
             print(f"\n==> Running fusion on {csv_path}")
-            fuse_obbs_from_csv(csv_path)
+            fuse_obbs_from_csv(
+                csv_path,
+                extent_method=args.extent_method,
+                envelope_padding_m=args.envelope_padding_m,
+            )
 
         if os.path.exists(csv2d_out_path):
             print(f"==> 2D BB CSV exists: {csv2d_out_path}")
@@ -861,7 +879,11 @@ def main():
         from utils.fuse_3d_boxes import fuse_obbs_from_csv
 
         print(f"\n==> Running fusion on {csv_path}")
-        fuse_obbs_from_csv(csv_path)
+        fuse_obbs_from_csv(
+            csv_path,
+            extent_method=args.extent_method,
+            envelope_padding_m=args.envelope_padding_m,
+        )
 
     if tracker is not None:
         active_tracks = tracker._get_active_tracks()
