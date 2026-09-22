@@ -154,18 +154,34 @@ python view_prompt.py --input scene0707_00
 ## Timestamped video + aligned point cloud
 
 A sequence directory can be passed directly when it contains `video.mp4`,
-`aligned.ply`, and `output_poses_registered_with_intrinsics.txt`. Pose rows use:
+`aligned.ply`, `output_poses_registered.txt`, and `arkit_poses.json`. Pose rows
+use:
 
 ```
-frame x y z qx qy qz qw fx fy cx cy width height timestamp
+frame x y z qx qy qz qw
 ```
 
-The loader seeks the video using `timestamp` (the `frame` column is ignored),
-scales the per-row intrinsics to the decoded image, and samples the large binary
-PLY without loading the full cloud into memory.
+The loader seeks the video at `frame / video_fps` (2 FPS by default), obtains
+intrinsics from the nearest ARKit sample within 50 ms, scales them to the
+decoded image, and samples the large binary PLY without loading the full cloud
+into memory.
 
 ```bash
 python run_boxer.py --input /path/to/sequence --labels=tub,vanity,toilet --fuse
+```
+
+The same pipeline can be called from another project with explicit file paths.
+This mode automatically runs fusion and writes `spatiallm_bboxes.txt` directly
+inside `--output_dir`:
+
+```bash
+python /path/to/boxer/run_boxer.py \
+  --video /data/scan/video.mp4 \
+  --point_cloud /data/scan/aligned.ply \
+  --poses_registered /data/scan/output_poses_registered.txt \
+  --poses_arkit /data/scan/arkit_poses.json \
+  --labels='tub,vanity,toilet,shower,shower fixture,wall,window,door,soffit' \
+  --output_dir /data/scan/boxer_output
 ```
 
 ## run_boxer.py Usage Details
@@ -210,6 +226,9 @@ Results are written to `output/<sequence_name>/`:
 - `boxer_3dbbs.csv` — per-frame 3D bounding boxes
 - `owl_2dbbs.csv` — per-frame 2D detections
 - `boxer_3dbbs_tracked.csv` — tracked 3D boxes (with `--track`)
+- `boxer_3dbbs_fused.csv` — surviving static boxes (with `--fuse`)
+- `spatiallm_bboxes.txt` — surviving boxes in SpatialLM `Bbox(...)` syntax
+  (with `--fuse`)
 - `boxer_viz_final.mp4` — visualization video
 
 ### CLI Reference

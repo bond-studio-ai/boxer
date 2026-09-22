@@ -94,6 +94,10 @@ def main():
     # fmt: off
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default=DEFAULT_SEQ, help="path to the sequence folder")
+    parser.add_argument("--video", type=str, help="video file for explicit timestamped-video input")
+    parser.add_argument("--point_cloud", "--point-cloud", dest="point_cloud", type=str, help="aligned PLY for explicit timestamped-video input")
+    parser.add_argument("--poses_registered", "--poses-registered", dest="poses_registered", type=str, help="registered pose text file (frame x y z qx qy qz qw)")
+    parser.add_argument("--poses_arkit", "--poses-arkit", dest="poses_arkit", type=str, help="ARKit JSON containing timestamped camera intrinsics")
     parser.add_argument("--skip_n", type=int, default=1, help="skip n frames")
     parser.add_argument("--start_n", type=int, default=1, help="start from n-th frame")
     parser.add_argument("--max_n", type=int, default=99999, help="run for max n frames")
@@ -113,15 +117,35 @@ def main():
     parser.add_argument("--no_csv", action="store_true", help="skip CSV writing")
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
     parser.add_argument("--gt2d", action="store_true", help="use GT pseudo 2DBB as input")
-    parser.add_argument("--fuse", action="store_true", help="run offline 3D box fusion after processing")
+    parser.add_argument("--fuse", action="store_true", help="run offline 3D box fusion and save spatiallm_bboxes.txt after processing")
     parser.add_argument("--track", action="store_true", help="run online 3D box tracking and show tracked boxes in Top Down View")
     parser.add_argument("--ckpt", type=str, default=os.path.join(CKPT_PATH, DEFAULT_BOXERNET_CKPT), help="path to BoxerNet checkpoint")
     parser.add_argument("--force_precision", type=str, default=None, choices=["float32", "bfloat16"], help="Override auto-detected inference precision")
     parser.add_argument("--output_dir", type=str, default=EVAL_PATH, help="Output directory for results (default: output/)")
     args = parser.parse_args()
 
+    explicit_values = {
+        "--video": args.video,
+        "--point_cloud": args.point_cloud,
+        "--poses_registered": args.poses_registered,
+        "--poses_arkit": args.poses_arkit,
+    }
+    explicit_input = any(value is not None for value in explicit_values.values())
+    if explicit_input:
+        missing = [name for name, value in explicit_values.items() if value is None]
+        if missing:
+            parser.error(
+                "explicit file input requires all four arguments; missing "
+                + ", ".join(missing)
+            )
+        # The explicit-file interface is intended as a complete external API:
+        # always produce the requested SpatialLM-style result.
+        args.fuse = True
+
     if args.fuse and args.track:
         parser.error("--fuse and --track are mutually exclusive")
+    if args.fuse and args.no_csv:
+        parser.error("--fuse requires CSV output; remove --no_csv")
     if args.cache3d:
         args.cache2d = True
     args.viz_headless = not args.skip_viz
@@ -144,7 +168,7 @@ def main():
         _t_prev = now
 
     # Determine dataset type and seq_name from input string
-    is_video_ply = all(
+    is_video_ply = explicit_input or all(
         os.path.isfile(os.path.join(args.input, name))
         for name in (
             "video.mp4",
@@ -155,7 +179,12 @@ def main():
     )
     if is_video_ply:
         dataset_type = "video_ply"
-        seq_name = os.path.basename(args.input.rstrip("/"))
+        if explicit_input:
+            seq_name = os.path.basename(
+                os.path.dirname(os.path.abspath(os.path.expanduser(args.point_cloud)))
+            )
+        else:
+            seq_name = os.path.basename(args.input.rstrip("/"))
     elif bool(re.search(r"scene\d{4}_\d{2}", args.input)) or "/scannet/" in args.input:
         dataset_type = "scannet"
         seq_name = os.path.basename(args.input.rstrip("/"))
@@ -180,7 +209,9 @@ def main():
 
     # get name of containing directory
     output_dir = os.path.expanduser(args.output_dir)
-    log_dir = os.path.join(output_dir, seq_name)
+    # Explicit file inputs treat --output_dir as the exact result directory,
+    # which makes this interface predictable when called from another project.
+    log_dir = output_dir if explicit_input else os.path.join(output_dir, seq_name)
     os.makedirs(log_dir, exist_ok=True)
     csv_path = os.path.join(log_dir, f"{args.write_name}_3dbbs.csv")
     csv2d_out_path = os.path.join(log_dir, "owl_2dbbs.csv")
@@ -212,13 +243,25 @@ def main():
 
     # Create data loader
     if dataset_type == "video_ply":
-        loader = VideoPlyLoader(
-            sequence_dir=args.input,
-            skip_frames=args.skip_n,
-            max_frames=args.max_n,
-            start_frame=args.start_n,
-            fps=args.video_fps,
-        )
+        if explicit_input:
+            loader = VideoPlyLoader(
+                video_path=args.video,
+                cloud_path=args.point_cloud,
+                pose_path=args.poses_registered,
+                arkit_pose_path=args.poses_arkit,
+                skip_frames=args.skip_n,
+                max_frames=args.max_n,
+                start_frame=args.start_n,
+                fps=args.video_fps,
+            )
+        else:
+            loader = VideoPlyLoader(
+                sequence_dir=args.input,
+                skip_frames=args.skip_n,
+                max_frames=args.max_n,
+                start_frame=args.start_n,
+                fps=args.video_fps,
+            )
     elif dataset_type == "scannet":
         loader = ScanNetLoader(
             scene_dir=args.input,

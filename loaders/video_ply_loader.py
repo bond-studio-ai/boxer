@@ -193,20 +193,49 @@ class VideoPlyLoader(BaseLoader):
 
     def __init__(
         self,
-        sequence_dir: str,
+        sequence_dir: str | None = None,
         skip_frames: int = 1,
         max_frames: int | None = None,
         start_frame: int = 1,
         max_cloud_points: int = 250_000,
         fps: float = 2.0,
         max_intrinsics_delta_s: float = 0.05,
+        *,
+        video_path: str | None = None,
+        cloud_path: str | None = None,
+        pose_path: str | None = None,
+        arkit_pose_path: str | None = None,
     ):
-        self.sequence_dir = os.path.abspath(os.path.expanduser(sequence_dir))
-        self.scene_id = os.path.basename(self.sequence_dir.rstrip("/"))
-        self.video_path = os.path.join(self.sequence_dir, "video.mp4")
-        self.pose_path = os.path.join(self.sequence_dir, "output_poses_registered.txt")
-        self.arkit_pose_path = os.path.join(self.sequence_dir, "arkit_poses.json")
-        self.cloud_path = os.path.join(self.sequence_dir, "aligned.ply")
+        explicit_paths = (video_path, cloud_path, pose_path, arkit_pose_path)
+        if any(path is not None for path in explicit_paths):
+            if not all(path is not None for path in explicit_paths):
+                raise ValueError(
+                    "video_path, cloud_path, pose_path, and arkit_pose_path "
+                    "must be provided together"
+                )
+            self.sequence_dir = None
+            self.video_path = os.path.abspath(os.path.expanduser(video_path))
+            self.cloud_path = os.path.abspath(os.path.expanduser(cloud_path))
+            self.pose_path = os.path.abspath(os.path.expanduser(pose_path))
+            self.arkit_pose_path = os.path.abspath(
+                os.path.expanduser(arkit_pose_path)
+            )
+            self.scene_id = os.path.basename(os.path.dirname(self.cloud_path))
+        else:
+            if sequence_dir is None:
+                raise ValueError(
+                    "sequence_dir or all four explicit input paths are required"
+                )
+            self.sequence_dir = os.path.abspath(os.path.expanduser(sequence_dir))
+            self.scene_id = os.path.basename(self.sequence_dir.rstrip("/"))
+            self.video_path = os.path.join(self.sequence_dir, "video.mp4")
+            self.pose_path = os.path.join(
+                self.sequence_dir, "output_poses_registered.txt"
+            )
+            self.arkit_pose_path = os.path.join(
+                self.sequence_dir, "arkit_poses.json"
+            )
+            self.cloud_path = os.path.join(self.sequence_dir, "aligned.ply")
         for path in (
             self.video_path,
             self.pose_path,

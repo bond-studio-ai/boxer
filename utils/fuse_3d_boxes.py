@@ -39,6 +39,51 @@ from utils.tw.tensor_utils import (
     unpad_string,
 )
 
+
+SPATIALLM_CLASS_ALIASES = {
+    "shower": "shower_room",
+    "toilet": "toilet",
+    "vanity": "sink",
+    "tub": "tub",
+    "bathtub": "tub",
+}
+
+
+def _spatiallm_class_name(label: str) -> str:
+    """Map detector labels to SpatialLM names and normalize other labels."""
+    normalized = label.strip().lower().replace("-", " ")
+    if normalized in SPATIALLM_CLASS_ALIASES:
+        return SPATIALLM_CLASS_ALIASES[normalized]
+    return "_".join(normalized.split())
+
+
+def format_spatiallm_bboxes(obbs: ObbTW) -> list[str]:
+    """Format static OBBs as ``bbox_N=Bbox(class,x,y,z,yaw,sx,sy,sz)``."""
+    lines = []
+    for index, obb in enumerate(obbs):
+        label = _spatiallm_class_name(obb.text_string())
+        x, y, z = (float(value) for value in obb.T_world_object.t)
+        rotation = obb.T_world_object.R
+        yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+        extent = obb.bb3_object
+        sx = float(extent[1] - extent[0])
+        sy = float(extent[3] - extent[2])
+        sz = float(extent[5] - extent[4])
+        values = ",".join(
+            format(value, ".17g") for value in (x, y, z, yaw, sx, sy, sz)
+        )
+        lines.append(f"bbox_{index}=Bbox({label},{values})")
+    return lines
+
+
+def write_spatiallm_bboxes(obbs: ObbTW, output_path: str) -> list[str]:
+    """Write and return SpatialLM-style bounding-box declarations."""
+    lines = format_spatiallm_bboxes(obbs)
+    with open(output_path, "w", encoding="utf-8") as target:
+        if lines:
+            target.write("\n".join(lines) + "\n")
+    return lines
+
 # =============================================================================
 # Shared helper functions (used by both BoundingBox3DFuser and BoundingBox3DTracker)
 # =============================================================================
@@ -1170,12 +1215,16 @@ def fuse_obbs_from_csv(
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_fused{ext}"
+    spatiallm_output_path = os.path.join(
+        os.path.dirname(output_path) or ".", "spatiallm_bboxes.txt"
+    )
 
     print(f"==> Loading OBBs from {input_path}")
     timed_obbs = read_obb_csv(input_path)
 
     if len(timed_obbs) == 0:
         print("==> No OBBs found in input file, nothing to fuse")
+        write_spatiallm_bboxes(ObbTW(torch.zeros(0, 165)), spatiallm_output_path)
         return []
 
     # Concatenate all OBBs from all timestamps
@@ -1207,7 +1256,11 @@ def fuse_obbs_from_csv(
     print(f"==> Fused into {len(fused_instances)} static instances")
 
     if len(fused_instances) == 0:
-        print("==> No fused instances produced, skipping output")
+        write_spatiallm_bboxes(ObbTW(torch.zeros(0, 165)), spatiallm_output_path)
+        print(
+            "==> No fused instances produced; saved an empty SpatialLM file to "
+            f"{spatiallm_output_path}"
+        )
         return []
 
     # Extract OBBs from fused instances
@@ -1232,6 +1285,11 @@ def fuse_obbs_from_csv(
     writer.write(fused_obbs, timestamps_ns=0, sem_id_to_name=sem_id_to_name)
     writer.close()
     print(f"==> Saved {len(fused_instances)} fused OBBs to {output_path}")
+
+    spatiallm_lines = write_spatiallm_bboxes(fused_obbs, spatiallm_output_path)
+    print(f"==> Saved SpatialLM bounding boxes to {spatiallm_output_path}")
+    for line in spatiallm_lines:
+        print(line)
 
     return fused_instances
 

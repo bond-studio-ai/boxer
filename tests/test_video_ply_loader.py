@@ -1,11 +1,18 @@
 import json
 
 import numpy as np
+import pytest
 
 from loaders.video_ply_loader import (
+    VideoPlyLoader,
     _intrinsics_for_display_orientation,
     _load_poses_with_nearest_intrinsics,
 )
+
+
+def test_explicit_loader_paths_must_be_supplied_together():
+    with pytest.raises(ValueError, match="must be provided together"):
+        VideoPlyLoader(video_path="video.mp4")
 
 
 def test_load_poses_uses_frame_over_fps_and_drops_distant_samples(tmp_path):

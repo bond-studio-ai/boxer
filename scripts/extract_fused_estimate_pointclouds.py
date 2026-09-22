@@ -25,11 +25,16 @@ def main():
         default="boxer_3dbbs_fused_min2.csv",
         help="Per-sequence fused-box CSV to extract",
     )
+    parser.add_argument(
+        "--sequence-glob",
+        default="20260915_12*",
+        help="Glob selecting sequence directories under results-root",
+    )
     parser.add_argument("--chunk-size", type=int, default=1_000_000)
     args = parser.parse_args()
 
     fused_csvs = sorted(
-        glob.glob(os.path.join(args.results_root, "20260915_12*", args.fused_filename))
+        glob.glob(os.path.join(args.results_root, args.sequence_glob, args.fused_filename))
     )
     manifest = []
     for fused_csv in fused_csvs:

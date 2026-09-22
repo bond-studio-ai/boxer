@@ -52,10 +52,15 @@ def main():
         default=",".join(LABELS),
         help="Comma-separated labels to include",
     )
+    parser.add_argument(
+        "--sequence-glob",
+        default="20260915_12*",
+        help="Glob selecting sequence directories under output_root",
+    )
     args = parser.parse_args()
     labels = tuple(label.strip() for label in args.labels.split(",") if label.strip())
 
-    sequence_dirs = sorted(glob.glob(os.path.join(args.output_root, "20260915_12*")))
+    sequence_dirs = sorted(glob.glob(os.path.join(args.output_root, args.sequence_glob)))
     summary_dir = os.path.join(args.output_root, "summary")
     os.makedirs(summary_dir, exist_ok=True)
 

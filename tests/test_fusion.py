@@ -15,6 +15,7 @@ from utils.fuse_3d_boxes import (
     BoundingBox3DFuser,
     align_boxes_r90,
     angular_distance,
+    format_spatiallm_bboxes,
     weighted_yaw_mean,
 )
 from utils.tw.obb import make_obb
@@ -56,6 +57,27 @@ def _extract_yaw(obb):
     """Extract yaw angle in radians from an ObbTW."""
     R = obb.T_world_object.R.cpu().numpy()
     return float(np.arctan2(R[1, 0], R[0, 0]))
+
+
+def test_spatiallm_bbox_format_and_class_aliases():
+    obbs = torch.stack(
+        [
+            _make_test_obb(
+                [1.0, 2.0, 3.0], sz=(4.0, 5.0, 6.0), yaw=0.25, text="shower"
+            ),
+            _make_test_obb(
+                [-1.0, -2.0, -3.0], sz=(0.5, 0.75, 1.0), text="vanity"
+            ),
+            _make_test_obb([0.0, 0.0, 0.0], text="shower fixture"),
+        ]
+    )
+
+    lines = format_spatiallm_bboxes(obbs)
+
+    assert lines[0].startswith("bbox_0=Bbox(shower_room,1,2,3,")
+    assert lines[0].endswith(",4,5,6)")
+    assert lines[1].startswith("bbox_1=Bbox(sink,-1,-2,-3,")
+    assert lines[2].startswith("bbox_2=Bbox(shower_fixture,0,0,0,")
 
 
 # =============================================================================
