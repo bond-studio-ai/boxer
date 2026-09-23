@@ -16,6 +16,8 @@ from utils.taxonomy import (
     SSI_NAME2SEM,
     SSI_SEM2NAME,
     TEXT2COLORS,
+    canonicalize_detection_label,
+    expand_detection_prompt_aliases,
     load_text_labels,
 )
 
@@ -64,6 +66,23 @@ class TestColorDicts:
 
 
 class TestLoadTextLabels:
+    def test_vanity_expands_to_sink_as_one_canonical_nms_group(self):
+        prompts, labels, groups = expand_detection_prompt_aliases(
+            ["tub", "vanity", "toilet"]
+        )
+        assert prompts == ["tub", "vanity", "sink", "toilet"]
+        assert labels == ["tub", "vanity", "vanity", "toilet"]
+        assert groups == [0, 1, 1, 2]
+
+    def test_sink_and_vanity_are_deduplicated_and_canonicalized(self):
+        prompts, labels, groups = expand_detection_prompt_aliases(
+            ["sink", "vanity"]
+        )
+        assert prompts == ["vanity", "sink"]
+        assert labels == ["vanity", "vanity"]
+        assert groups == [0, 0]
+        assert canonicalize_detection_label("Sink") == "vanity"
+
     def test_custom_list_passthrough(self):
         """When given a list of strings that don't match a file, return as-is."""
         labels = ["cat", "dog", "bird"]

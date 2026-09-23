@@ -150,6 +150,9 @@ def main():
             object_name = box["object"]
             chunks = selected_chunks[object_name]
             subset = np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)
+            if len(subset) == 0:
+                print(f"{sequence} {object_name}: 0 points (omitted)")
+                continue
             output_path = os.path.join(sequence_output, f"{object_name}.ply")
             write_ply(output_path, header, subset)
             manifest.append(
@@ -175,7 +178,15 @@ def main():
 
     manifest_path = os.path.join(args.output_root, "manifest.csv")
     with open(manifest_path, "w", newline="") as target:
-        writer = csv.DictWriter(target, fieldnames=list(manifest[0]))
+        fieldnames = [
+            "sequence",
+            "object",
+            "points",
+            "source_points",
+            "fraction",
+            "output_ply",
+        ]
+        writer = csv.DictWriter(target, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(manifest)
     print(f"Saved manifest: {manifest_path}")

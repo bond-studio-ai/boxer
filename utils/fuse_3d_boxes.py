@@ -48,6 +48,25 @@ SPATIALLM_CLASS_ALIASES = {
     "bathtub": "tub",
 }
 
+_PLY_DTYPES = {
+    "char": "i1",
+    "uchar": "u1",
+    "int8": "i1",
+    "uint8": "u1",
+    "short": "<i2",
+    "ushort": "<u2",
+    "int16": "<i2",
+    "uint16": "<u2",
+    "int": "<i4",
+    "uint": "<u4",
+    "int32": "<i4",
+    "uint32": "<u4",
+    "float": "<f4",
+    "float32": "<f4",
+    "double": "<f8",
+    "float64": "<f8",
+}
+
 
 def _spatiallm_class_name(label: str) -> str:
     """Map detector labels to SpatialLM names and normalize other labels."""
@@ -76,9 +95,119 @@ def format_spatiallm_bboxes(obbs: ObbTW) -> list[str]:
     return lines
 
 
-def write_spatiallm_bboxes(obbs: ObbTW, output_path: str) -> list[str]:
+def _read_ply_vertex_layout(path: str) -> tuple[int, int, np.dtype]:
+    """Return binary little-endian PLY vertex count, offset, and dtype."""
+    properties = []
+    vertex_count = None
+    is_binary_little_endian = False
+    with open(path, "rb") as source:
+        if source.readline().decode("ascii").strip() != "ply":
+            raise ValueError(f"Not a PLY file: {path}")
+        in_vertices = False
+        while True:
+            line = source.readline()
+            if not line:
+                raise ValueError(f"PLY header has no end_header: {path}")
+            text = line.decode("ascii").strip()
+            fields = text.split()
+            if fields[:2] == ["format", "binary_little_endian"]:
+                is_binary_little_endian = True
+            elif fields[:2] == ["element", "vertex"]:
+                vertex_count = int(fields[2])
+                in_vertices = True
+            elif fields and fields[0] == "element":
+                in_vertices = False
+            elif in_vertices and fields and fields[0] == "property":
+                if fields[1] == "list":
+                    raise ValueError("List properties in PLY vertices are unsupported")
+                properties.append((fields[2], _PLY_DTYPES[fields[1]]))
+            elif text == "end_header":
+                data_offset = source.tell()
+                break
+    if not is_binary_little_endian:
+        raise ValueError(f"Only binary little-endian PLY files are supported: {path}")
+    if vertex_count is None or not {"x", "y", "z"}.issubset(dict(properties)):
+        raise ValueError(f"PLY vertex XYZ fields are missing: {path}")
+    return vertex_count, data_offset, np.dtype(properties)
+
+
+def format_spatiallm_point_subset_aabbs(
+    obbs: ObbTW, point_cloud_path: str, chunk_size: int = 1_000_000
+) -> list[str]:
+    """Format world-axis-aligned bounds of points enclosed by each fused OBB."""
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    count = len(obbs)
+    if count == 0:
+        return []
+
+    vertex_count, offset, dtype = _read_ply_vertex_layout(point_cloud_path)
+    vertices = np.memmap(
+        point_cloud_path,
+        dtype=dtype,
+        mode="r",
+        offset=offset,
+        shape=(vertex_count,),
+    )
+    centers = obbs.T_world_object.t.detach().cpu().numpy().astype(np.float64)
+    rotations = obbs.T_world_object.R.detach().cpu().numpy().astype(np.float64)
+    extents = obbs.bb3_object.detach().cpu().numpy().astype(np.float64)
+    lower = extents[:, [0, 2, 4]]
+    upper = extents[:, [1, 3, 5]]
+    subset_min = np.full((count, 3), np.inf, dtype=np.float64)
+    subset_max = np.full((count, 3), -np.inf, dtype=np.float64)
+    point_counts = np.zeros(count, dtype=np.int64)
+
+    for start in range(0, vertex_count, chunk_size):
+        chunk = vertices[start : min(start + chunk_size, vertex_count)]
+        xyz = np.column_stack((chunk["x"], chunk["y"], chunk["z"])).astype(
+            np.float64, copy=False
+        )
+        finite = np.isfinite(xyz).all(axis=1)
+        for index in range(count):
+            local = (xyz - centers[index]) @ rotations[index]
+            inside = finite & np.all(
+                (local >= lower[index] - 1e-7)
+                & (local <= upper[index] + 1e-7),
+                axis=1,
+            )
+            if inside.any():
+                selected = xyz[inside]
+                subset_min[index] = np.minimum(
+                    subset_min[index], selected.min(axis=0)
+                )
+                subset_max[index] = np.maximum(
+                    subset_max[index], selected.max(axis=0)
+                )
+                point_counts[index] += int(inside.sum())
+
+    lines = []
+    for obb_index, obb in enumerate(obbs):
+        if point_counts[obb_index] == 0:
+            print(
+                "==> Warning: omitting SpatialLM box for "
+                f"'{obb.text_string()}': fused point subset is empty"
+            )
+            continue
+        label = _spatiallm_class_name(obb.text_string())
+        center = 0.5 * (subset_min[obb_index] + subset_max[obb_index])
+        size = subset_max[obb_index] - subset_min[obb_index]
+        values = ",".join(
+            format(value, ".17g") for value in (*center, 0.0, *size)
+        )
+        lines.append(f"bbox_{len(lines)}=Bbox({label},{values})")
+    return lines
+
+
+def write_spatiallm_bboxes(
+    obbs: ObbTW, output_path: str, point_cloud_path: str | None = None
+) -> list[str]:
     """Write and return SpatialLM-style bounding-box declarations."""
-    lines = format_spatiallm_bboxes(obbs)
+    lines = (
+        format_spatiallm_point_subset_aabbs(obbs, point_cloud_path)
+        if point_cloud_path is not None
+        else format_spatiallm_bboxes(obbs)
+    )
     with open(output_path, "w", encoding="utf-8") as target:
         if lines:
             target.write("\n".join(lines) + "\n")
@@ -1189,6 +1318,7 @@ def fuse_obbs_from_csv(
     extent_iou_threshold: float = 0.1,
     face_min_support: int = 3,
     face_tolerance_m: float = 0.15,
+    point_cloud_path: str | None = None,
 ) -> list[FusedInstance]:
     """
     Load OBBs from a CSV file, fuse them, and save the results.
@@ -1207,6 +1337,8 @@ def fuse_obbs_from_csv(
         extent_iou_threshold: Relaxed same-label overlap for extent evidence
         face_min_support: Independent timestamps required per outer face
         face_tolerance_m: Face consensus tolerance in metres
+        point_cloud_path: Aligned PLY used to derive axis-aligned SpatialLM
+            boxes from the fused object point subsets
 
     Returns:
         List of fused instances
@@ -1286,7 +1418,11 @@ def fuse_obbs_from_csv(
     writer.close()
     print(f"==> Saved {len(fused_instances)} fused OBBs to {output_path}")
 
-    spatiallm_lines = write_spatiallm_bboxes(fused_obbs, spatiallm_output_path)
+    spatiallm_lines = write_spatiallm_bboxes(
+        fused_obbs,
+        spatiallm_output_path,
+        point_cloud_path=point_cloud_path,
+    )
     print(f"==> Saved SpatialLM bounding boxes to {spatiallm_output_path}")
     for line in spatiallm_lines:
         print(line)
@@ -1310,6 +1446,13 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to output obb_fused.csv file (default: input path with _fused suffix)",
+    )
+    parser.add_argument(
+        "--point-cloud",
+        "--point_cloud",
+        dest="point_cloud",
+        default=None,
+        help="Aligned PLY used to write point-subset AABBs to spatiallm_bboxes.txt",
     )
     parser.add_argument(
         "--iou",
@@ -1386,6 +1529,7 @@ def main() -> None:
         extent_iou_threshold=args.extent_iou_threshold,
         face_min_support=args.face_min_support,
         face_tolerance_m=args.face_tolerance_m,
+        point_cloud_path=args.point_cloud,
     )
 
 

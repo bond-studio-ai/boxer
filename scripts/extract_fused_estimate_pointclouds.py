@@ -101,6 +101,9 @@ def main():
         for box, chunks in zip(boxes, selected):
             subset = np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)
             stem = f"{box['name']}_fused_{box['estimate_index']:02d}"
+            if len(subset) == 0:
+                print(f"{sequence} {stem}: 0 points (omitted)")
+                continue
             output_path = os.path.join(sequence_output, f"{stem}.ply")
             write_ply(output_path, header, subset)
             manifest.append(
@@ -127,7 +130,17 @@ def main():
     os.makedirs(args.output_root, exist_ok=True)
     manifest_path = os.path.join(args.output_root, "manifest.csv")
     with open(manifest_path, "w", newline="") as target:
-        writer = csv.DictWriter(target, fieldnames=list(manifest[0]))
+        fieldnames = [
+            "sequence",
+            "estimate",
+            "object",
+            "confidence",
+            "points",
+            "source_points",
+            "output_ply",
+            "fused_box_csv",
+        ]
+        writer = csv.DictWriter(target, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(manifest)
     print(f"Saved {len(manifest)} fused-estimate PLYs and manifest {manifest_path}")

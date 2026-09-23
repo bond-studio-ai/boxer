@@ -16,6 +16,7 @@ from utils.fuse_3d_boxes import (
     align_boxes_r90,
     angular_distance,
     format_spatiallm_bboxes,
+    format_spatiallm_point_subset_aabbs,
     weighted_yaw_mean,
 )
 from utils.tw.obb import make_obb
@@ -78,6 +79,38 @@ def test_spatiallm_bbox_format_and_class_aliases():
     assert lines[0].endswith(",4,5,6)")
     assert lines[1].startswith("bbox_1=Bbox(sink,-1,-2,-3,")
     assert lines[2].startswith("bbox_2=Bbox(shower_fixture,0,0,0,")
+
+
+def test_spatiallm_uses_axis_aligned_bounds_of_fused_point_subset(tmp_path):
+    ply_path = tmp_path / "aligned.ply"
+    points = np.array(
+        [(-0.5, -0.25, 0.0), (0.75, 0.4, 1.0), (5.0, 5.0, 5.0)],
+        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4")],
+    )
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        "element vertex 3\nproperty float x\nproperty float y\n"
+        "property float z\nend_header\n"
+    ).encode("ascii")
+    with open(ply_path, "wb") as target:
+        target.write(header)
+        points.tofile(target)
+
+    obbs = torch.stack(
+        [_make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 2.0, 2.0), text="vanity")]
+    )
+    lines = format_spatiallm_point_subset_aabbs(obbs, str(ply_path))
+
+    fields = (
+        lines[0]
+        .removeprefix("bbox_0=Bbox(sink,")
+        .removesuffix(")")
+        .split(",")
+    )
+    np.testing.assert_allclose(
+        [float(value) for value in fields],
+        [0.125, 0.075, 0.5, 0.0, 1.25, 0.65, 1.0],
+    )
 
 
 # =============================================================================

@@ -172,7 +172,8 @@ python run_boxer.py --input /path/to/sequence --labels=tub,vanity,toilet --fuse
 
 The same pipeline can be called from another project with explicit file paths.
 This mode automatically runs fusion and writes `spatiallm_bboxes.txt` directly
-inside `--output_dir`:
+inside `--output_dir`. Its boxes are world-axis-aligned bounds of the aligned
+point-cloud subsets enclosed by the surviving fused boxes:
 
 ```bash
 python /path/to/boxer/run_boxer.py \
@@ -183,6 +184,10 @@ python /path/to/boxer/run_boxer.py \
   --labels='tub,vanity,toilet,shower,shower fixture,wall,window,door,soffit' \
   --output_dir /data/scan/boxer_output
 ```
+
+`vanity` is a canonical object class with two detector prompts: `vanity` and
+`sink`. Both prompt results share 2D NMS and are written as `vanity` internally
+(and as `sink` in the SpatialLM-compatible output), so they fuse as one object.
 
 ## run_boxer.py Usage Details
 

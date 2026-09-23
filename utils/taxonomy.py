@@ -14,6 +14,51 @@ _LABELS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "owl"
 )
 
+_DETECTION_PROMPT_ALIASES = {
+    "vanity": ("vanity", "sink"),
+    "sink": ("vanity", "sink"),
+}
+
+
+def canonicalize_detection_label(label: str) -> str:
+    """Normalize detector synonyms to the object name used by fusion."""
+    normalized = " ".join(label.strip().lower().replace("-", " ").split())
+    if normalized in ("vanity", "sink"):
+        return "vanity"
+    return label
+
+
+def expand_detection_prompt_aliases(
+    labels: List[str],
+) -> tuple[List[str], List[str], List[int]]:
+    """Expand detector prompts while retaining one canonical object class.
+
+    Returns detector prompts, the canonical label for each prompt, and integer
+    NMS groups. Alias prompts share an NMS group so they cannot create duplicate
+    boxes for the same image region.
+    """
+    prompts = []
+    prompt_labels = []
+    canonical_labels = []
+    canonical_to_group = {}
+    seen_prompts = set()
+    nms_groups = []
+    for label in labels:
+        canonical = canonicalize_detection_label(label)
+        if canonical not in canonical_to_group:
+            canonical_to_group[canonical] = len(canonical_labels)
+            canonical_labels.append(canonical)
+        normalized = " ".join(label.strip().lower().replace("-", " ").split())
+        label_prompts = _DETECTION_PROMPT_ALIASES.get(normalized, (label,))
+        for prompt in label_prompts:
+            if prompt in seen_prompts:
+                continue
+            seen_prompts.add(prompt)
+            prompts.append(prompt)
+            prompt_labels.append(canonical)
+            nms_groups.append(canonical_to_group[canonical])
+    return prompts, prompt_labels, nms_groups
+
 
 def load_text_labels(
     label_list: Union[str, List[str]], verbose: bool = False

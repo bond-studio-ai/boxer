@@ -30,7 +30,11 @@ from utils.demo_utils import (
 )
 from utils.file_io import ObbCsvWriter2, load_bb2d_csv, read_obb_csv, save_bb2d_csv
 from utils.image import draw_bb3s, put_text, render_bb2, render_depth_patches, torch2cv2
-from utils.taxonomy import load_text_labels
+from utils.taxonomy import (
+    canonicalize_detection_label,
+    expand_detection_prompt_aliases,
+    load_text_labels,
+)
 from utils.tw.tensor_utils import (
     pad_string,
     string2tensor,
@@ -232,6 +236,14 @@ def main():
     print(f"==> Created output folder {log_dir}")
     _dbg("setup")
 
+    fusion_point_cloud_path = None
+    if dataset_type == "video_ply":
+        fusion_point_cloud_path = (
+            args.point_cloud
+            if explicit_input
+            else os.path.join(args.input, "aligned.ply")
+        )
+
     # --cache3d: skip detection + BoxerNet + loader, go straight to post-processing
     if args.cache3d:
         print(f"==> Loading cached 3D BBs from {csv_path}")
@@ -249,6 +261,7 @@ def main():
                 csv_path,
                 extent_method=args.extent_method,
                 envelope_padding_m=args.envelope_padding_m,
+                point_cloud_path=fusion_point_cloud_path,
             )
 
         if os.path.exists(csv2d_out_path):
@@ -347,18 +360,31 @@ def main():
     print(f"==> Using device {device}")
 
     # Load text labels if they match special strings.
-    text_labels = load_text_labels(args.labels)
+    requested_text_labels = load_text_labels(args.labels)
+    detector_prompts, detector_prompt_labels, detector_nms_groups = (
+        expand_detection_prompt_aliases(requested_text_labels)
+    )
+    text_labels = list(dict.fromkeys(detector_prompt_labels))
     # Track taxonomy name for visualization
     taxonomy_name = args.labels[0] if args.labels else "custom"
     if not args.gt2d:
         print(f"==> Using text prompts ({taxonomy_name}):")
-        if len(text_labels) > 64:
-            print(text_labels[:64])
+        if len(detector_prompts) > 64:
+            print(detector_prompts[:64])
             print(
-                f"    ... and {len(text_labels) - 64} more (total: {len(text_labels)})"
+                f"    ... and {len(detector_prompts) - 64} more "
+                f"(total: {len(detector_prompts)})"
             )
         else:
-            print(text_labels)
+            print(detector_prompts)
+        if detector_prompts != text_labels:
+            aliases = [
+                f"{prompt}->{label}"
+                for prompt, label in zip(detector_prompts, detector_prompt_labels)
+                if prompt != label
+            ]
+            if aliases:
+                print(f"==> Prompt aliases: {', '.join(aliases)}")
 
     # Load 2D detector (skip if --cache2d)
     if args.cache2d:
@@ -374,9 +400,10 @@ def main():
 
         owl = OwlWrapper(
             device,
-            text_prompts=text_labels,
+            text_prompts=detector_prompts,
             min_confidence=args.thresh2d,
             precision=args.force_precision,
+            nms_label_groups=detector_nms_groups,
         )
         method = "OWLv2"
     _dbg("owl")
@@ -568,7 +595,11 @@ def main():
                 img_torch_255,
                 resize_to_HW=(args.detector_hw, args.detector_hw),
             )
-            labels2d = [text_labels[label_int] for label_int in label_ints]
+            labels2d = [detector_prompt_labels[label_int] for label_int in label_ints]
+
+        # Cached and ground-truth labels pass through the same canonicalization
+        # as live detector output, so sink and vanity remain one object class.
+        labels2d = [canonicalize_detection_label(label) for label in labels2d]
 
         t_owl = timer.stop("owl")
 
@@ -697,20 +728,27 @@ def main():
             t_sec = int(datum["time_ns0"]) / 1e9
             put_text(viz_2d, f"frame {ii}, t={t_sec:.3f}s", scale=0.5, line=2)
             max_labels = 64
-            if len(text_labels) > max_labels:
+            if len(detector_prompts) > max_labels:
                 line = -1
             else:
-                line = -1 - len(text_labels)
-                for jj, label in enumerate(text_labels[:max_labels]):
+                line = -1 - len(detector_prompts)
+                for jj, (prompt, canonical) in enumerate(
+                    zip(detector_prompts[:max_labels], detector_prompt_labels)
+                ):
                     put_text(
-                        viz_2d, label, scale=0.4, line=-1 - jj, color=colors[label]
+                        viz_2d,
+                        prompt,
+                        scale=0.4,
+                        line=-1 - jj,
+                        color=colors[canonical],
                     )
             if args.gt2d:
                 put_text(viz_2d, f"{len(bb2d)} 2DBB PROMPTS", scale=0.4, line=line)
             else:
                 put_text(
                     viz_2d,
-                    f"{len(text_labels)} TEXT PROMPTS ({taxonomy_name})",
+                    f"{len(detector_prompts)} TEXT PROMPTS / "
+                    f"{len(text_labels)} OBJECT CLASSES ({taxonomy_name})",
                     scale=0.4,
                     line=line,
                 )
@@ -883,6 +921,7 @@ def main():
             csv_path,
             extent_method=args.extent_method,
             envelope_padding_m=args.envelope_padding_m,
+            point_cloud_path=fusion_point_cloud_path,
         )
 
     if tracker is not None:

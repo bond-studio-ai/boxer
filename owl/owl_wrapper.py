@@ -187,6 +187,7 @@ class OwlWrapper(nn.Module):
         precision="float32",
         warmup=True,
         nms_iou_threshold=0.5,
+        nms_label_groups=None,
     ):
         super().__init__()
         _debug = os.environ.get("DEBUG", "0") == "1"
@@ -239,6 +240,11 @@ class OwlWrapper(nn.Module):
         self.text_prompts = text_prompts
         self.min_confidence = min_confidence
         self.nms_iou_threshold = nms_iou_threshold
+        if nms_label_groups is None:
+            nms_label_groups = list(range(len(text_prompts)))
+        if len(nms_label_groups) != len(text_prompts):
+            raise ValueError("nms_label_groups must match the number of text prompts")
+        self.nms_label_groups = torch.as_tensor(nms_label_groups, dtype=torch.long)
         if precision is not None:
             self.use_bfloat16 = precision == "bfloat16" and device not in ("cpu", "mps")
         else:
@@ -311,11 +317,16 @@ class OwlWrapper(nn.Module):
             embeds = embeds.to(dtype=torch.bfloat16)
         return embeds
 
-    def set_text_prompts(self, prompts):
+    def set_text_prompts(self, prompts, nms_label_groups=None):
         """Update text prompts and re-compute cached embeddings."""
         self.text_prompts = prompts
         self.text_embeddings = self._encode_text(prompts)
         self.query_mask = torch.ones(len(prompts), dtype=torch.bool, device=self.device)
+        if nms_label_groups is None:
+            nms_label_groups = list(range(len(prompts)))
+        if len(nms_label_groups) != len(prompts):
+            raise ValueError("nms_label_groups must match the number of text prompts")
+        self.nms_label_groups = torch.as_tensor(nms_label_groups, dtype=torch.long)
 
     def _warmup(self, steps=1):
         """Warmup the vision model with dummy inference."""
@@ -416,7 +427,10 @@ class OwlWrapper(nn.Module):
 
         # Per-class NMS
         if self.nms_iou_threshold < 1.0:
-            keep = _per_class_nms(boxes, scores, labels, self.nms_iou_threshold)
+            nms_labels = self.nms_label_groups[labels]
+            keep = _per_class_nms(
+                boxes, scores, nms_labels, self.nms_iou_threshold
+            )
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
