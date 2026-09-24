@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7
+FROM ghcr.io/astral-sh/uv:0.8.22 AS uv
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+COPY --from=uv /uv /usr/local/bin/uv
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl ffmpeg libgl1 libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+RUN uv venv --python 3.12 --seed /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
+
+RUN pip install --no-cache-dir \
+    torch==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128 && \
+    pip install --no-cache-dir \
+    dill==0.4.0 numpy==2.2.6 opencv-python-headless==4.12.0.88 \
+    pillow==11.3.0 tqdm==4.67.1
+COPY gcp_worker/requirements.txt /tmp/gcp-worker-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/gcp-worker-requirements.txt
+
+WORKDIR /app
+COPY . /app
+
+ARG BOXER_MODEL_REVISION=bfba91291fb3f137c18eb6e45362eeda827eac7b
+ARG SOURCE_REVISION=local-build
+RUN test "$BOXER_MODEL_REVISION" = "bfba91291fb3f137c18eb6e45362eeda827eac7b" && \
+    mkdir -p /app/ckpts && \
+    curl --fail --location --retry 5 --output /app/ckpts/boxernet_hw960in2x6d768-c88128f8.ckpt \
+      "https://huggingface.co/facebook/boxer/resolve/${BOXER_MODEL_REVISION}/boxernet_hw960in2x6d768-c88128f8.ckpt" && \
+    echo "d5a30b348a8f5b0e5990ff3aa0e8f473ce77d860da22586322e7f47abc83ca6f  /app/ckpts/boxernet_hw960in2x6d768-c88128f8.ckpt" | sha256sum -c - && \
+    curl --fail --location --retry 5 --output /app/ckpts/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth \
+      "https://huggingface.co/facebook/boxer/resolve/${BOXER_MODEL_REVISION}/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth" && \
+    echo "4057cbaaad8c16657adb09d6815f28d4164eeba30532fde23f0d17313124caea  /app/ckpts/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth" | sha256sum -c - && \
+    curl --fail --location --retry 5 --output /app/ckpts/owlv2-base-patch16-ensemble.pt \
+      "https://huggingface.co/facebook/boxer/resolve/${BOXER_MODEL_REVISION}/owlv2-base-patch16-ensemble.pt" && \
+    echo "14aa78ffe7b13e5b3ebf55845bc9a07e339a095cfd88f4c4e8f726b38ce1ebbf  /app/ckpts/owlv2-base-patch16-ensemble.pt" | sha256sum -c -
+
+RUN python -c "import cv2, torch; import gcp_worker.contract; import run_boxer; print(torch.__version__, cv2.__version__)" && \
+    printf '%s\n' \
+      "boxer_source=${SOURCE_REVISION}" \
+      "model_revision=${BOXER_MODEL_REVISION}" \
+      > /opt/build-manifest.txt
+
+ENTRYPOINT ["python", "-m", "gcp_worker"]

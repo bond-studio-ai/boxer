@@ -1,0 +1,16 @@
+name: GCP worker offline tests
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m unittest tests.test_gcp_worker
+      - uses: astral-sh/setup-uv@v8.2.0
+      - run: uvx ruff check gcp_worker tests/test_gcp_worker.py
+      - run: uvx ruff format --check gcp_worker tests/test_gcp_worker.py
