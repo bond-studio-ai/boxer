@@ -19,6 +19,7 @@ from boxernet.boxernet import BoxerNet
 from loaders.ca_loader import CALoader
 from loaders.omni_loader import OMNI3D_DATASETS, OmniLoader
 from loaders.scannet_loader import ScanNetLoader
+from loaders.video_ply_loader import VideoPlyLoader
 from utils.demo_utils import (
     CKPT_PATH,
     DEFAULT_BOXERNET_CKPT,
@@ -29,7 +30,11 @@ from utils.demo_utils import (
 )
 from utils.file_io import ObbCsvWriter2, load_bb2d_csv, read_obb_csv, save_bb2d_csv
 from utils.image import draw_bb3s, put_text, render_bb2, render_depth_patches, torch2cv2
-from utils.taxonomy import load_text_labels
+from utils.taxonomy import (
+    canonicalize_detection_label,
+    expand_detection_prompt_aliases,
+    load_text_labels,
+)
 from utils.tw.tensor_utils import (
     pad_string,
     string2tensor,
@@ -50,7 +55,9 @@ def jet_colors_bgr(scores):
     """Vectorized: map array of scores in [0,1] to list of BGR (int) tuples."""
     if len(scores) == 0:
         return []
-    vals = np.clip(np.array(scores, dtype=np.float32), 0.0, 1.0)
+    if isinstance(scores, torch.Tensor):
+        scores = scores.detach().cpu().numpy()
+    vals = np.clip(np.asarray(scores, dtype=np.float32), 0.0, 1.0)
     u8 = (vals * 255).astype(np.uint8).reshape(1, -1)
     bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)[0]  # (N, 3)
     return [tuple(int(c) for c in row) for row in bgr]
@@ -91,9 +98,14 @@ def main():
     # fmt: off
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default=DEFAULT_SEQ, help="path to the sequence folder")
+    parser.add_argument("--video", type=str, help="video file for explicit timestamped-video input")
+    parser.add_argument("--point_cloud", "--point-cloud", dest="point_cloud", type=str, help="aligned PLY for explicit timestamped-video input")
+    parser.add_argument("--poses_registered", "--poses-registered", dest="poses_registered", type=str, help="registered pose text file (frame x y z qx qy qz qw)")
+    parser.add_argument("--poses_arkit", "--poses-arkit", dest="poses_arkit", type=str, help="ARKit JSON containing timestamped camera intrinsics")
     parser.add_argument("--skip_n", type=int, default=1, help="skip n frames")
     parser.add_argument("--start_n", type=int, default=1, help="start from n-th frame")
     parser.add_argument("--max_n", type=int, default=99999, help="run for max n frames")
+    parser.add_argument("--video_fps", type=float, default=2.0, help="FPS used to convert registered pose frame numbers to timestamps (default: 2)")
     parser.add_argument("--pinhole", action="store_true", help="rectify to pinhole")
     parser.add_argument("--camera", type=str, default="rgb", choices=["rgb", "slaml", "slamr"], help="camera to use (default: rgb)")
     parser.add_argument("--detector", type=str, default="owl", choices=["owl"], help="2D detector to use (default: owl)")
@@ -109,15 +121,49 @@ def main():
     parser.add_argument("--no_csv", action="store_true", help="skip CSV writing")
     parser.add_argument("--force_cpu", action="store_true", help="force CPU")
     parser.add_argument("--gt2d", action="store_true", help="use GT pseudo 2DBB as input")
-    parser.add_argument("--fuse", action="store_true", help="run offline 3D box fusion after processing")
+    parser.add_argument("--fuse", action="store_true", help="run offline 3D box fusion and save spatiallm_bboxes.txt after processing")
+    parser.add_argument(
+        "--extent-method",
+        dest="extent_method",
+        choices=("mean", "robust_envelope", "consensus_envelope"),
+        default="mean",
+        help="How to calculate fused box extents (default: mean)",
+    )
+    parser.add_argument(
+        "--envelope-padding-m",
+        dest="envelope_padding_m",
+        type=float,
+        default=0.0,
+        help="Padding added to each robust-envelope face in metres (default: 0.0)",
+    )
     parser.add_argument("--track", action="store_true", help="run online 3D box tracking and show tracked boxes in Top Down View")
     parser.add_argument("--ckpt", type=str, default=os.path.join(CKPT_PATH, DEFAULT_BOXERNET_CKPT), help="path to BoxerNet checkpoint")
     parser.add_argument("--force_precision", type=str, default=None, choices=["float32", "bfloat16"], help="Override auto-detected inference precision")
     parser.add_argument("--output_dir", type=str, default=EVAL_PATH, help="Output directory for results (default: output/)")
     args = parser.parse_args()
 
+    explicit_values = {
+        "--video": args.video,
+        "--point_cloud": args.point_cloud,
+        "--poses_registered": args.poses_registered,
+        "--poses_arkit": args.poses_arkit,
+    }
+    explicit_input = any(value is not None for value in explicit_values.values())
+    if explicit_input:
+        missing = [name for name, value in explicit_values.items() if value is None]
+        if missing:
+            parser.error(
+                "explicit file input requires all four arguments; missing "
+                + ", ".join(missing)
+            )
+        # The explicit-file interface is intended as a complete external API:
+        # always produce the requested SpatialLM-style result.
+        args.fuse = True
+
     if args.fuse and args.track:
         parser.error("--fuse and --track are mutually exclusive")
+    if args.fuse and args.no_csv:
+        parser.error("--fuse requires CSV output; remove --no_csv")
     if args.cache3d:
         args.cache2d = True
     args.viz_headless = not args.skip_viz
@@ -140,7 +186,24 @@ def main():
         _t_prev = now
 
     # Determine dataset type and seq_name from input string
-    if bool(re.search(r"scene\d{4}_\d{2}", args.input)) or "/scannet/" in args.input:
+    is_video_ply = explicit_input or all(
+        os.path.isfile(os.path.join(args.input, name))
+        for name in (
+            "video.mp4",
+            "aligned.ply",
+            "output_poses_registered.txt",
+            "arkit_poses.json",
+        )
+    )
+    if is_video_ply:
+        dataset_type = "video_ply"
+        if explicit_input:
+            seq_name = os.path.basename(
+                os.path.dirname(os.path.abspath(os.path.expanduser(args.point_cloud)))
+            )
+        else:
+            seq_name = os.path.basename(args.input.rstrip("/"))
+    elif bool(re.search(r"scene\d{4}_\d{2}", args.input)) or "/scannet/" in args.input:
         dataset_type = "scannet"
         seq_name = os.path.basename(args.input.rstrip("/"))
     elif args.input in OMNI3D_DATASETS:
@@ -164,12 +227,22 @@ def main():
 
     # get name of containing directory
     output_dir = os.path.expanduser(args.output_dir)
-    log_dir = os.path.join(output_dir, seq_name)
+    # Explicit file inputs treat --output_dir as the exact result directory,
+    # which makes this interface predictable when called from another project.
+    log_dir = output_dir if explicit_input else os.path.join(output_dir, seq_name)
     os.makedirs(log_dir, exist_ok=True)
     csv_path = os.path.join(log_dir, f"{args.write_name}_3dbbs.csv")
     csv2d_out_path = os.path.join(log_dir, "owl_2dbbs.csv")
     print(f"==> Created output folder {log_dir}")
     _dbg("setup")
+
+    fusion_point_cloud_path = None
+    if dataset_type == "video_ply":
+        fusion_point_cloud_path = (
+            args.point_cloud
+            if explicit_input
+            else os.path.join(args.input, "aligned.ply")
+        )
 
     # --cache3d: skip detection + BoxerNet + loader, go straight to post-processing
     if args.cache3d:
@@ -184,7 +257,12 @@ def main():
             from utils.fuse_3d_boxes import fuse_obbs_from_csv
 
             print(f"\n==> Running fusion on {csv_path}")
-            fuse_obbs_from_csv(csv_path)
+            fuse_obbs_from_csv(
+                csv_path,
+                extent_method=args.extent_method,
+                envelope_padding_m=args.envelope_padding_m,
+                point_cloud_path=fusion_point_cloud_path,
+            )
 
         if os.path.exists(csv2d_out_path):
             print(f"==> 2D BB CSV exists: {csv2d_out_path}")
@@ -195,7 +273,27 @@ def main():
         return
 
     # Create data loader
-    if dataset_type == "scannet":
+    if dataset_type == "video_ply":
+        if explicit_input:
+            loader = VideoPlyLoader(
+                video_path=args.video,
+                cloud_path=args.point_cloud,
+                pose_path=args.poses_registered,
+                arkit_pose_path=args.poses_arkit,
+                skip_frames=args.skip_n,
+                max_frames=args.max_n,
+                start_frame=args.start_n,
+                fps=args.video_fps,
+            )
+        else:
+            loader = VideoPlyLoader(
+                sequence_dir=args.input,
+                skip_frames=args.skip_n,
+                max_frames=args.max_n,
+                start_frame=args.start_n,
+                fps=args.video_fps,
+            )
+    elif dataset_type == "scannet":
         loader = ScanNetLoader(
             scene_dir=args.input,
             annotation_path=os.path.join(
@@ -262,18 +360,31 @@ def main():
     print(f"==> Using device {device}")
 
     # Load text labels if they match special strings.
-    text_labels = load_text_labels(args.labels)
+    requested_text_labels = load_text_labels(args.labels)
+    detector_prompts, detector_prompt_labels, detector_nms_groups = (
+        expand_detection_prompt_aliases(requested_text_labels)
+    )
+    text_labels = list(dict.fromkeys(detector_prompt_labels))
     # Track taxonomy name for visualization
     taxonomy_name = args.labels[0] if args.labels else "custom"
     if not args.gt2d:
         print(f"==> Using text prompts ({taxonomy_name}):")
-        if len(text_labels) > 64:
-            print(text_labels[:64])
+        if len(detector_prompts) > 64:
+            print(detector_prompts[:64])
             print(
-                f"    ... and {len(text_labels) - 64} more (total: {len(text_labels)})"
+                f"    ... and {len(detector_prompts) - 64} more "
+                f"(total: {len(detector_prompts)})"
             )
         else:
-            print(text_labels)
+            print(detector_prompts)
+        if detector_prompts != text_labels:
+            aliases = [
+                f"{prompt}->{label}"
+                for prompt, label in zip(detector_prompts, detector_prompt_labels)
+                if prompt != label
+            ]
+            if aliases:
+                print(f"==> Prompt aliases: {', '.join(aliases)}")
 
     # Load 2D detector (skip if --cache2d)
     if args.cache2d:
@@ -289,9 +400,10 @@ def main():
 
         owl = OwlWrapper(
             device,
-            text_prompts=text_labels,
+            text_prompts=detector_prompts,
             min_confidence=args.thresh2d,
             precision=args.force_precision,
+            nms_label_groups=detector_nms_groups,
         )
         method = "OWLv2"
     _dbg("owl")
@@ -342,6 +454,7 @@ def main():
         sem_id_to_name = {v: k for k, v in sem_name_to_id.items()}
 
     writer = None if args.no_csv else ObbCsvWriter2(csv_path)
+    has_written_2d = False
 
     tracker = None
     if args.track:
@@ -482,7 +595,11 @@ def main():
                 img_torch_255,
                 resize_to_HW=(args.detector_hw, args.detector_hw),
             )
-            labels2d = [text_labels[label_int] for label_int in label_ints]
+            labels2d = [detector_prompt_labels[label_int] for label_int in label_ints]
+
+        # Cached and ground-truth labels pass through the same canonicalization
+        # as live detector output, so sink and vanity remain one object class.
+        labels2d = [canonicalize_detection_label(label) for label in labels2d]
 
         t_owl = timer.stop("owl")
 
@@ -506,8 +623,8 @@ def main():
             precision_dtype = torch.bfloat16
         else:
             precision_dtype = torch.float32
-        # MPS does not support torch.autocast
-        if device == "mps":
+        # CPU float32 and MPS do not benefit from this CUDA autocast path.
+        if device != "cuda":
             outputs = boxernet.forward(datum)
         else:
             with torch.autocast(device_type=device, dtype=precision_dtype):
@@ -561,7 +678,7 @@ def main():
                 scores=scores2d,
                 labels=labels2d,
                 sem_name_to_id=sem_name_to_id,
-                append=(ii > 0),
+                append=has_written_2d,
                 time_ns=time_ns,
                 img_width=WW,
                 img_height=HH,
@@ -570,6 +687,7 @@ def main():
                 if hasattr(loader, "device_name")
                 else "unknown",
             )
+            has_written_2d = True
         t_csv = timer.stop("csv")
 
         active_tracks = None
@@ -610,20 +728,27 @@ def main():
             t_sec = int(datum["time_ns0"]) / 1e9
             put_text(viz_2d, f"frame {ii}, t={t_sec:.3f}s", scale=0.5, line=2)
             max_labels = 64
-            if len(text_labels) > max_labels:
+            if len(detector_prompts) > max_labels:
                 line = -1
             else:
-                line = -1 - len(text_labels)
-                for jj, label in enumerate(text_labels[:max_labels]):
+                line = -1 - len(detector_prompts)
+                for jj, (prompt, canonical) in enumerate(
+                    zip(detector_prompts[:max_labels], detector_prompt_labels)
+                ):
                     put_text(
-                        viz_2d, label, scale=0.4, line=-1 - jj, color=colors[label]
+                        viz_2d,
+                        prompt,
+                        scale=0.4,
+                        line=-1 - jj,
+                        color=colors[canonical],
                     )
             if args.gt2d:
                 put_text(viz_2d, f"{len(bb2d)} 2DBB PROMPTS", scale=0.4, line=line)
             else:
                 put_text(
                     viz_2d,
-                    f"{len(text_labels)} TEXT PROMPTS ({taxonomy_name})",
+                    f"{len(detector_prompts)} TEXT PROMPTS / "
+                    f"{len(text_labels)} OBJECT CLASSES ({taxonomy_name})",
                     scale=0.4,
                     line=line,
                 )
@@ -792,7 +917,12 @@ def main():
         from utils.fuse_3d_boxes import fuse_obbs_from_csv
 
         print(f"\n==> Running fusion on {csv_path}")
-        fuse_obbs_from_csv(csv_path)
+        fuse_obbs_from_csv(
+            csv_path,
+            extent_method=args.extent_method,
+            envelope_padding_m=args.envelope_padding_m,
+            point_cloud_path=fusion_point_cloud_path,
+        )
 
     if tracker is not None:
         active_tracks = tracker._get_active_tracks()

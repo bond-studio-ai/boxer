@@ -48,6 +48,7 @@ In this repo, we provide sample code for running on the following data sources:
 * CA-1M
 * SUN-RGBD
 * ScanNet (manual download needed)
+* Timestamped MP4 + aligned PLY reconstructions
 
 Let's first start with Aria data. We host three sample [Project Aria](https://www.projectaria.com/) sequences (hohen_gen1, nym10_gen1, cook0_gen2) on [HuggingFace](https://huggingface.co/datasets/facebook/boxer). Download them to the `sample_data/` directory:
 
@@ -150,6 +151,44 @@ python view_prompt.py --input scene0707_00
 
 ![ScanNet Prompt](docs/images/scannet_screenshot.jpg)
 
+## Timestamped video + aligned point cloud
+
+A sequence directory can be passed directly when it contains `video.mp4`,
+`aligned.ply`, `output_poses_registered.txt`, and `arkit_poses.json`. Pose rows
+use:
+
+```
+frame x y z qx qy qz qw
+```
+
+The loader seeks the video at `frame / video_fps` (2 FPS by default), obtains
+intrinsics from the nearest ARKit sample within 50 ms, scales them to the
+decoded image, and samples the large binary PLY without loading the full cloud
+into memory.
+
+```bash
+python run_boxer.py --input /path/to/sequence --labels=tub,vanity,toilet --fuse
+```
+
+The same pipeline can be called from another project with explicit file paths.
+This mode automatically runs fusion and writes `spatiallm_bboxes.txt` directly
+inside `--output_dir`. Its boxes are world-axis-aligned bounds of the aligned
+point-cloud subsets enclosed by the surviving fused boxes:
+
+```bash
+python /path/to/boxer/run_boxer.py \
+  --video /data/scan/video.mp4 \
+  --point_cloud /data/scan/aligned.ply \
+  --poses_registered /data/scan/output_poses_registered.txt \
+  --poses_arkit /data/scan/arkit_poses.json \
+  --labels='tub,vanity,toilet,shower,shower fixture,wall,window,door,soffit' \
+  --output_dir /data/scan/boxer_output
+```
+
+`vanity` is a canonical object class with two detector prompts: `vanity` and
+`sink`. Both prompt results share 2D NMS and are written as `vanity` internally
+(and as `sink` in the SpatialLM-compatible output), so they fuse as one object.
+
 ## run_boxer.py Usage Details
 
 The pipeline supports optional **online 3D tracking** (`--track`) for temporal consistency and **offline 3D fusion** (`--fuse`) for merging detections across frames after all detections have been made.
@@ -192,6 +231,9 @@ Results are written to `output/<sequence_name>/`:
 - `boxer_3dbbs.csv` — per-frame 3D bounding boxes
 - `owl_2dbbs.csv` — per-frame 2D detections
 - `boxer_3dbbs_tracked.csv` — tracked 3D boxes (with `--track`)
+- `boxer_3dbbs_fused.csv` — surviving static boxes (with `--fuse`)
+- `spatiallm_bboxes.txt` — surviving boxes in SpatialLM `Bbox(...)` syntax
+  (with `--fuse`)
 - `boxer_viz_final.mp4` — visualization video
 
 ### CLI Reference

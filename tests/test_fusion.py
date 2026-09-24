@@ -15,6 +15,8 @@ from utils.fuse_3d_boxes import (
     BoundingBox3DFuser,
     align_boxes_r90,
     angular_distance,
+    format_spatiallm_bboxes,
+    format_spatiallm_point_subset_aabbs,
     weighted_yaw_mean,
 )
 from utils.tw.obb import make_obb
@@ -56,6 +58,59 @@ def _extract_yaw(obb):
     """Extract yaw angle in radians from an ObbTW."""
     R = obb.T_world_object.R.cpu().numpy()
     return float(np.arctan2(R[1, 0], R[0, 0]))
+
+
+def test_spatiallm_bbox_format_and_class_aliases():
+    obbs = torch.stack(
+        [
+            _make_test_obb(
+                [1.0, 2.0, 3.0], sz=(4.0, 5.0, 6.0), yaw=0.25, text="shower"
+            ),
+            _make_test_obb(
+                [-1.0, -2.0, -3.0], sz=(0.5, 0.75, 1.0), text="vanity"
+            ),
+            _make_test_obb([0.0, 0.0, 0.0], text="shower fixture"),
+        ]
+    )
+
+    lines = format_spatiallm_bboxes(obbs)
+
+    assert lines[0].startswith("bbox_0=Bbox(shower_room,1,2,3,")
+    assert lines[0].endswith(",4,5,6)")
+    assert lines[1].startswith("bbox_1=Bbox(sink,-1,-2,-3,")
+    assert lines[2].startswith("bbox_2=Bbox(shower_fixture,0,0,0,")
+
+
+def test_spatiallm_uses_axis_aligned_bounds_of_fused_point_subset(tmp_path):
+    ply_path = tmp_path / "aligned.ply"
+    points = np.array(
+        [(-0.5, -0.25, 0.0), (0.75, 0.4, 1.0), (5.0, 5.0, 5.0)],
+        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4")],
+    )
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        "element vertex 3\nproperty float x\nproperty float y\n"
+        "property float z\nend_header\n"
+    ).encode("ascii")
+    with open(ply_path, "wb") as target:
+        target.write(header)
+        points.tofile(target)
+
+    obbs = torch.stack(
+        [_make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 2.0, 2.0), text="vanity")]
+    )
+    lines = format_spatiallm_point_subset_aabbs(obbs, str(ply_path))
+
+    fields = (
+        lines[0]
+        .removeprefix("bbox_0=Bbox(sink,")
+        .removesuffix(")")
+        .split(",")
+    )
+    np.testing.assert_allclose(
+        [float(value) for value in fields],
+        [0.125, 0.075, 0.5, 0.0, 1.25, 0.65, 1.0],
+    )
 
 
 # =============================================================================
@@ -515,6 +570,101 @@ class TestBoundingBox3DFuser(unittest.TestCase):
         expected = torch.tensor([0.0, 0.0, 0.5])
         self.assertTrue(torch.allclose(fused_pos, expected, atol=0.1))
 
+    def test_robust_envelope_preserves_consensus_object_faces(self):
+        """Partial detections must not pull a well-supported outer face inward."""
+        obbs = [
+            _make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        # These cover only the positive half of the same object.
+        obbs.extend(
+            _make_test_obb([0.5, 0.0, 0.5], sz=(1.0, 1.0, 1.0))
+            for _ in range(2)
+        )
+        detections = torch.stack(obbs)
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            confidence_weighting="uniform",
+            conf_threshold=0.0,
+            extent_method="robust_envelope",
+            envelope_quantile=0.4,
+            envelope_padding_m=0.03,
+        )
+
+        instance = fuser._fuse_clusters(detections, [list(range(5))])[0]
+        center_x = float(instance.obb.T_world_object.t[0])
+        extent_x = float(
+            instance.obb.bb3_object[1] - instance.obb.bb3_object[0]
+        )
+
+        self.assertLessEqual(center_x - extent_x / 2.0, -1.02)
+        self.assertGreaterEqual(center_x + extent_x / 2.0, 1.02)
+
+    def test_consensus_envelope_uses_repeated_extent_only_evidence(self):
+        """Three secondary frames can restore a face missing from the primary cluster."""
+        partial = [
+            _make_test_obb([0.5, 0.0, 0.5], sz=(1.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        full = [
+            _make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        detections = torch.stack(partial + full)
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            confidence_weighting="uniform",
+            conf_threshold=0.0,
+            extent_method="consensus_envelope",
+            envelope_padding_m=0.03,
+            face_min_support=3,
+            face_tolerance_m=0.15,
+        )
+
+        instance = fuser._fuse_clusters(
+            detections,
+            [list(range(3))],
+            extent_clusters=[list(range(6))],
+            detection_group_ids=torch.arange(6),
+        )[0]
+        center_x = float(instance.obb.T_world_object.t[0])
+        extent_x = float(instance.obb.bb3_object[1] - instance.obb.bb3_object[0])
+
+        self.assertLessEqual(center_x - extent_x / 2.0, -1.02)
+        self.assertGreaterEqual(center_x + extent_x / 2.0, 1.02)
+
+    def test_consensus_envelope_counts_each_frame_once(self):
+        """Duplicate detections from one frame cannot satisfy face support alone."""
+        partial = [
+            _make_test_obb([0.5, 0.0, 0.5], sz=(1.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        duplicate_full = [
+            _make_test_obb([0.0, 0.0, 0.5], sz=(2.0, 1.0, 1.0))
+            for _ in range(3)
+        ]
+        detections = torch.stack(partial + duplicate_full)
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            confidence_weighting="uniform",
+            conf_threshold=0.0,
+            extent_method="consensus_envelope",
+            envelope_quantile=0.4,
+            envelope_padding_m=0.0,
+            face_min_support=3,
+        )
+
+        instance = fuser._fuse_clusters(
+            detections,
+            [list(range(3))],
+            extent_clusters=[list(range(6))],
+            detection_group_ids=torch.tensor([0, 1, 2, 3, 3, 3]),
+        )[0]
+        center_x = float(instance.obb.T_world_object.t[0])
+        extent_x = float(instance.obb.bb3_object[1] - instance.obb.bb3_object[0])
+
+        self.assertGreater(center_x - extent_x / 2.0, -0.5)
+
     def test_empty_detections(self):
         """Empty input should return empty list."""
         fuser = BoundingBox3DFuser(min_detections=1, conf_threshold=0.0)
@@ -538,6 +688,26 @@ class TestBoundingBox3DFuser(unittest.TestCase):
         detections = torch.stack(obbs)
         instances = fuser.fuse(detections)
         self.assertEqual(len(instances), 0)
+
+    def test_shower_fixture_uses_lower_conf_threshold(self):
+        fuser = BoundingBox3DFuser(
+            min_detections=1,
+            conf_threshold=0.55,
+            shower_fixture_conf_threshold=0.4,
+        )
+        detections = torch.stack(
+            [
+                _make_test_obb(
+                    [0.0, 0.0, 0.5], prob=0.45, text="shower fixture"
+                ),
+                _make_test_obb([5.0, 0.0, 0.5], prob=0.45, text="toilet"),
+            ]
+        )
+
+        instances = fuser.fuse(detections)
+
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].obb.text_string(), "shower fixture")
 
 
 # =============================================================================

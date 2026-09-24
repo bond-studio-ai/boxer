@@ -14,7 +14,11 @@ build/
 
 # OS
 .DS_Store
+Icon?
 Thumbs.db
+
+# Tool caches
+.ruff_cache/
 
 # Coverage
 .coverage

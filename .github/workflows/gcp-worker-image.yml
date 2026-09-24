@@ -1,0 +1,65 @@
+name: Build Boxer GCP worker image
+on:
+  pull_request:
+    paths:
+      - Dockerfile.gcp
+      - gcp_worker/**
+      - boxernet/**
+      - loaders/**
+      - owl/**
+      - utils/**
+      - run_boxer.py
+      - .github/workflows/gcp-worker-image.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.gcp
+      - gcp_worker/**
+      - boxernet/**
+      - loaders/**
+      - owl/**
+      - utils/**
+      - run_boxer.py
+      - .github/workflows/gcp-worker-image.yml
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  build:
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && vars.ENABLE_BOXER_GCP_IMAGE_BUILD == 'true')
+    runs-on: runs-on=${{ github.run_id }}/runner=8cpu-linux-x64/volume=100gb:gp3:500mbs:4000iops/spot=false
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: google-github-actions/auth@v3
+        if: github.event_name == 'push'
+        with:
+          workload_identity_provider: projects/723236667816/locations/global/workloadIdentityPools/github-renderfarm/providers/service-deploy
+          service_account: farm-service-deploy@bond-renderfarm.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v3
+        if: github.event_name == 'push'
+      - name: Build and inspect
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -f Dockerfile.gcp \
+            --build-arg "SOURCE_REVISION=${GITHUB_SHA}" \
+            -t boxer-worker:canary .
+          docker run --rm --entrypoint /opt/venv/bin/python boxer-worker:canary \
+            -c 'import cv2, torch; import google.cloud.pubsub_v1, google.cloud.storage; import gcp_worker.contract; import run_boxer; print("RUNTIME_IMPORT_OK", torch.__version__, cv2.__version__)'
+      - name: Push by digest
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker us-west1-docker.pkg.dev --quiet
+          image="us-west1-docker.pkg.dev/bond-renderfarm/farm/boxer-worker:main-${GITHUB_SHA}"
+          docker tag boxer-worker:canary "$image"
+          docker push "$image"
+          digest=$(gcloud artifacts docker images describe "$image" --format='value(image_summary.digest)')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "${digest#sha256:}" > image-digest.txt
+          echo "Pin Boxer imageDigest to ${digest#sha256:}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: boxer-worker-image-provenance
+          path: image-digest.txt

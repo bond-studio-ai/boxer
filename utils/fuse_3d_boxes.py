@@ -39,6 +39,180 @@ from utils.tw.tensor_utils import (
     unpad_string,
 )
 
+
+SPATIALLM_CLASS_ALIASES = {
+    "shower": "shower_room",
+    "toilet": "toilet",
+    "vanity": "sink",
+    "tub": "tub",
+    "bathtub": "tub",
+}
+
+_PLY_DTYPES = {
+    "char": "i1",
+    "uchar": "u1",
+    "int8": "i1",
+    "uint8": "u1",
+    "short": "<i2",
+    "ushort": "<u2",
+    "int16": "<i2",
+    "uint16": "<u2",
+    "int": "<i4",
+    "uint": "<u4",
+    "int32": "<i4",
+    "uint32": "<u4",
+    "float": "<f4",
+    "float32": "<f4",
+    "double": "<f8",
+    "float64": "<f8",
+}
+
+
+def _spatiallm_class_name(label: str) -> str:
+    """Map detector labels to SpatialLM names and normalize other labels."""
+    normalized = label.strip().lower().replace("-", " ")
+    if normalized in SPATIALLM_CLASS_ALIASES:
+        return SPATIALLM_CLASS_ALIASES[normalized]
+    return "_".join(normalized.split())
+
+
+def format_spatiallm_bboxes(obbs: ObbTW) -> list[str]:
+    """Format static OBBs as ``bbox_N=Bbox(class,x,y,z,yaw,sx,sy,sz)``."""
+    lines = []
+    for index, obb in enumerate(obbs):
+        label = _spatiallm_class_name(obb.text_string())
+        x, y, z = (float(value) for value in obb.T_world_object.t)
+        rotation = obb.T_world_object.R
+        yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+        extent = obb.bb3_object
+        sx = float(extent[1] - extent[0])
+        sy = float(extent[3] - extent[2])
+        sz = float(extent[5] - extent[4])
+        values = ",".join(
+            format(value, ".17g") for value in (x, y, z, yaw, sx, sy, sz)
+        )
+        lines.append(f"bbox_{index}=Bbox({label},{values})")
+    return lines
+
+
+def _read_ply_vertex_layout(path: str) -> tuple[int, int, np.dtype]:
+    """Return binary little-endian PLY vertex count, offset, and dtype."""
+    properties = []
+    vertex_count = None
+    is_binary_little_endian = False
+    with open(path, "rb") as source:
+        if source.readline().decode("ascii").strip() != "ply":
+            raise ValueError(f"Not a PLY file: {path}")
+        in_vertices = False
+        while True:
+            line = source.readline()
+            if not line:
+                raise ValueError(f"PLY header has no end_header: {path}")
+            text = line.decode("ascii").strip()
+            fields = text.split()
+            if fields[:2] == ["format", "binary_little_endian"]:
+                is_binary_little_endian = True
+            elif fields[:2] == ["element", "vertex"]:
+                vertex_count = int(fields[2])
+                in_vertices = True
+            elif fields and fields[0] == "element":
+                in_vertices = False
+            elif in_vertices and fields and fields[0] == "property":
+                if fields[1] == "list":
+                    raise ValueError("List properties in PLY vertices are unsupported")
+                properties.append((fields[2], _PLY_DTYPES[fields[1]]))
+            elif text == "end_header":
+                data_offset = source.tell()
+                break
+    if not is_binary_little_endian:
+        raise ValueError(f"Only binary little-endian PLY files are supported: {path}")
+    if vertex_count is None or not {"x", "y", "z"}.issubset(dict(properties)):
+        raise ValueError(f"PLY vertex XYZ fields are missing: {path}")
+    return vertex_count, data_offset, np.dtype(properties)
+
+
+def format_spatiallm_point_subset_aabbs(
+    obbs: ObbTW, point_cloud_path: str, chunk_size: int = 1_000_000
+) -> list[str]:
+    """Format world-axis-aligned bounds of points enclosed by each fused OBB."""
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    count = len(obbs)
+    if count == 0:
+        return []
+
+    vertex_count, offset, dtype = _read_ply_vertex_layout(point_cloud_path)
+    vertices = np.memmap(
+        point_cloud_path,
+        dtype=dtype,
+        mode="r",
+        offset=offset,
+        shape=(vertex_count,),
+    )
+    centers = obbs.T_world_object.t.detach().cpu().numpy().astype(np.float64)
+    rotations = obbs.T_world_object.R.detach().cpu().numpy().astype(np.float64)
+    extents = obbs.bb3_object.detach().cpu().numpy().astype(np.float64)
+    lower = extents[:, [0, 2, 4]]
+    upper = extents[:, [1, 3, 5]]
+    subset_min = np.full((count, 3), np.inf, dtype=np.float64)
+    subset_max = np.full((count, 3), -np.inf, dtype=np.float64)
+    point_counts = np.zeros(count, dtype=np.int64)
+
+    for start in range(0, vertex_count, chunk_size):
+        chunk = vertices[start : min(start + chunk_size, vertex_count)]
+        xyz = np.column_stack((chunk["x"], chunk["y"], chunk["z"])).astype(
+            np.float64, copy=False
+        )
+        finite = np.isfinite(xyz).all(axis=1)
+        for index in range(count):
+            local = (xyz - centers[index]) @ rotations[index]
+            inside = finite & np.all(
+                (local >= lower[index] - 1e-7)
+                & (local <= upper[index] + 1e-7),
+                axis=1,
+            )
+            if inside.any():
+                selected = xyz[inside]
+                subset_min[index] = np.minimum(
+                    subset_min[index], selected.min(axis=0)
+                )
+                subset_max[index] = np.maximum(
+                    subset_max[index], selected.max(axis=0)
+                )
+                point_counts[index] += int(inside.sum())
+
+    lines = []
+    for obb_index, obb in enumerate(obbs):
+        if point_counts[obb_index] == 0:
+            print(
+                "==> Warning: omitting SpatialLM box for "
+                f"'{obb.text_string()}': fused point subset is empty"
+            )
+            continue
+        label = _spatiallm_class_name(obb.text_string())
+        center = 0.5 * (subset_min[obb_index] + subset_max[obb_index])
+        size = subset_max[obb_index] - subset_min[obb_index]
+        values = ",".join(
+            format(value, ".17g") for value in (*center, 0.0, *size)
+        )
+        lines.append(f"bbox_{len(lines)}=Bbox({label},{values})")
+    return lines
+
+
+def write_spatiallm_bboxes(
+    obbs: ObbTW, output_path: str, point_cloud_path: str | None = None
+) -> list[str]:
+    """Write and return SpatialLM-style bounding-box declarations."""
+    lines = (
+        format_spatiallm_point_subset_aabbs(obbs, point_cloud_path)
+        if point_cloud_path is not None
+        else format_spatiallm_bboxes(obbs)
+    )
+    with open(output_path, "w", encoding="utf-8") as target:
+        if lines:
+            target.write("\n".join(lines) + "\n")
+    return lines
+
 # =============================================================================
 # Shared helper functions (used by both BoundingBox3DFuser and BoundingBox3DTracker)
 # =============================================================================
@@ -105,6 +279,61 @@ def angular_distance(angle1: float, angle2: float) -> float:
         diff = math.pi - diff
 
     return diff
+
+
+def weighted_quantile(
+    values: torch.Tensor, weights: torch.Tensor, quantile: float
+) -> torch.Tensor:
+    """Return a weighted quantile for each column of a 2D tensor."""
+    if values.ndim != 2:
+        raise ValueError("values must have shape (N, D)")
+    if weights.ndim != 1 or weights.shape[0] != values.shape[0]:
+        raise ValueError("weights must have shape (N,)")
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be in [0, 1]")
+
+    outputs = []
+    normalized_weights = weights / (weights.sum() + 1e-8)
+    for dimension in range(values.shape[1]):
+        sorted_values, order = torch.sort(values[:, dimension])
+        cumulative = torch.cumsum(normalized_weights[order], dim=0)
+        index = torch.searchsorted(
+            cumulative,
+            torch.tensor(quantile, dtype=cumulative.dtype, device=cumulative.device),
+        ).clamp(max=len(sorted_values) - 1)
+        outputs.append(sorted_values[index])
+    return torch.stack(outputs)
+
+
+def consensus_outer_face(
+    values: torch.Tensor,
+    group_ids: torch.Tensor,
+    *,
+    choose_lower: bool,
+    min_support: int,
+    tolerance_m: float,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """Estimate an outer face supported by multiple independent frames.
+
+    Multiple detections from one frame count once. Within a frame, the most
+    outward face is retained. The outermost face with ``min_support`` nearby
+    frame-level observations is returned as their median.
+    """
+    if values.ndim != 1 or group_ids.ndim != 1 or len(values) != len(group_ids):
+        raise ValueError("values and group_ids must be one-dimensional and aligned")
+
+    frame_values = []
+    for group_id in torch.unique(group_ids):
+        candidates = values[group_ids == group_id]
+        frame_values.append(candidates.min() if choose_lower else candidates.max())
+    frame_values = torch.stack(frame_values)
+    ordered = torch.sort(frame_values, descending=not choose_lower).values
+    for candidate in ordered:
+        nearby = frame_values[torch.abs(frame_values - candidate) <= tolerance_m]
+        if len(nearby) >= min_support:
+            return nearby.median()
+    return fallback
 
 
 def align_boxes_r90(
@@ -286,6 +515,13 @@ class BoundingBox3DFuser:
         enable_nms: bool = False,
         nms_iou_threshold: float = 0.6,
         conf_threshold: float = 0.55,
+        shower_fixture_conf_threshold: float = 0.4,
+        extent_method: str = "mean",
+        envelope_quantile: float = 0.4,
+        envelope_padding_m: float = 0.0,
+        extent_iou_threshold: float = 0.1,
+        face_min_support: int = 3,
+        face_tolerance_m: float = 0.15,
     ) -> None:
         """
         Initialize 3D box fusion system.
@@ -298,6 +534,16 @@ class BoundingBox3DFuser:
             enable_nms: If True, apply NMS to fused boxes with high IoU and semantic similarity
             nms_iou_threshold: IoU threshold for NMS (boxes with IoU > this are redundant)
             conf_threshold: Minimum confidence threshold to keep detections (default: 0.55)
+            shower_fixture_conf_threshold: Confidence threshold used only for
+                shower-fixture detections (default: 0.4)
+            extent_method: ``mean`` for the original size average, or
+                ``robust_envelope`` to estimate lower/upper faces independently
+            envelope_quantile: Robust-envelope trim quantile in [0, 0.5]
+            envelope_padding_m: Metric padding on every robust-envelope face
+            extent_iou_threshold: Relaxed IoU used to associate same-label
+                detections as extent-only evidence
+            face_min_support: Independent frames required to accept an outer face
+            face_tolerance_m: Maximum face-position difference for consensus
         """
         self.iou_threshold = iou_threshold
         self.min_detections = min_detections
@@ -307,9 +553,33 @@ class BoundingBox3DFuser:
         self.enable_nms = enable_nms
         self.nms_iou_threshold = nms_iou_threshold
         self.conf_threshold = conf_threshold
+        self.shower_fixture_conf_threshold = shower_fixture_conf_threshold
+        if not 0.0 <= shower_fixture_conf_threshold <= 1.0:
+            raise ValueError("shower_fixture_conf_threshold must be in [0, 1]")
+        if extent_method not in ("mean", "robust_envelope", "consensus_envelope"):
+            raise ValueError(f"Unknown extent method: {extent_method}")
+        if not 0.0 <= envelope_quantile <= 0.5:
+            raise ValueError("envelope_quantile must be in [0, 0.5]")
+        if envelope_padding_m < 0.0:
+            raise ValueError("envelope_padding_m must be nonnegative")
+        if not 0.0 <= extent_iou_threshold <= 1.0:
+            raise ValueError("extent_iou_threshold must be in [0, 1]")
+        if face_min_support < 1:
+            raise ValueError("face_min_support must be positive")
+        if face_tolerance_m < 0.0:
+            raise ValueError("face_tolerance_m must be nonnegative")
+        self.extent_method = extent_method
+        self.envelope_quantile = envelope_quantile
+        self.envelope_padding_m = envelope_padding_m
+        self.extent_iou_threshold = extent_iou_threshold
+        self.face_min_support = face_min_support
+        self.face_tolerance_m = face_tolerance_m
 
     def fuse(
-        self, detections: ObbTW, semantic_embeddings: Optional[torch.Tensor] = None
+        self,
+        detections: ObbTW,
+        semantic_embeddings: Optional[torch.Tensor] = None,
+        detection_group_ids: Optional[torch.Tensor] = None,
     ) -> List[FusedInstance]:
         """
         Fuse ObbTW detections into static instances.
@@ -317,6 +587,7 @@ class BoundingBox3DFuser:
         Args:
             detections: ObbTW tensor of shape (N, 165) containing N detections
             semantic_embeddings: Optional tensor of shape (N, D) with normalized embeddings
+            detection_group_ids: Optional frame/timestamp ID for each detection
 
         Returns:
             List of fused instances
@@ -329,17 +600,35 @@ class BoundingBox3DFuser:
         n = detections.shape[0]
         if n == 0:
             return []
+        if detection_group_ids is None:
+            detection_group_ids = torch.arange(n)
+        elif detection_group_ids.shape != (n,):
+            raise ValueError("detection_group_ids must have shape (N,)")
 
         # Step 0: Filter by confidence threshold
-        if self.conf_threshold > 0:
-            conf_mask = detections.prob.squeeze() >= self.conf_threshold
+        if self.conf_threshold > 0 or self.shower_fixture_conf_threshold > 0:
+            labels = detections.text_string()
+            thresholds = torch.tensor(
+                [
+                    self.shower_fixture_conf_threshold
+                    if label == "shower fixture"
+                    else self.conf_threshold
+                    for label in labels
+                ],
+                dtype=detections.prob.dtype,
+                device=detections.prob.device,
+            )
+            conf_mask = detections.prob.reshape(-1) >= thresholds
             n_before = n
             detections = detections[conf_mask]
+            detection_group_ids = detection_group_ids[conf_mask]
             if semantic_embeddings is not None:
                 semantic_embeddings = semantic_embeddings[conf_mask]
             n = detections.shape[0]
             print(
-                f"Filtered {n_before - n} detections below conf_threshold={self.conf_threshold} "
+                f"Filtered {n_before - n} detections below confidence thresholds "
+                f"(default={self.conf_threshold}, shower fixture="
+                f"{self.shower_fixture_conf_threshold}) "
                 f"({n_before} -> {n})"
             )
             if n == 0:
@@ -414,7 +703,31 @@ class BoundingBox3DFuser:
         # Step 3: Fuse boxes within each cluster
         print("\n[3/4] Fusing clusters...")
         step3_start = time.time()
-        instances = self._fuse_clusters(detections, clusters)
+        extent_clusters = None
+        if self.extent_method == "consensus_envelope":
+            if iou_matrix.is_sparse:
+                print("  Consensus extent association unavailable for sparse IoU; using primary clusters")
+                extent_clusters = clusters
+            else:
+                labels = detections.text_string()
+                extent_clusters = []
+                for cluster in clusters:
+                    cluster_labels = [labels[index] for index in cluster]
+                    label = max(set(cluster_labels), key=cluster_labels.count)
+                    overlap = iou_matrix[:, cluster].max(dim=1).values
+                    candidates = [
+                        index
+                        for index in range(n)
+                        if labels[index] == label
+                        and float(overlap[index]) >= self.extent_iou_threshold
+                    ]
+                    extent_clusters.append(sorted(set(cluster) | set(candidates)))
+        instances = self._fuse_clusters(
+            detections,
+            clusters,
+            extent_clusters=extent_clusters,
+            detection_group_ids=detection_group_ids,
+        )
         step3_time = time.time() - step3_start
         print(f"  ✓ Fused {len(instances)} instances: {step3_time:.3f}s")
 
@@ -576,7 +889,11 @@ class BoundingBox3DFuser:
         return clusters
 
     def _fuse_clusters(
-        self, detections: ObbTW, clusters: list[list[int]]
+        self,
+        detections: ObbTW,
+        clusters: list[list[int]],
+        extent_clusters: Optional[list[list[int]]] = None,
+        detection_group_ids: Optional[torch.Tensor] = None,
     ) -> list[FusedInstance]:
         """
         Fuse detections within each cluster into single instances.
@@ -593,7 +910,12 @@ class BoundingBox3DFuser:
         """
         instances = []
 
-        for cluster in clusters:
+        if extent_clusters is None:
+            extent_clusters = clusters
+        if detection_group_ids is None:
+            detection_group_ids = torch.arange(len(detections))
+
+        for cluster_index, cluster in enumerate(clusters):
             cluster_detections = detections[cluster]  # (M, 165)
 
             # Extract sizes and yaw angles
@@ -610,7 +932,7 @@ class BoundingBox3DFuser:
 
             # STEP 1: Align boxes to canonical orientation (accounts for 90° rotations)
             # Use base confidence weights for alignment reference
-            base_confidences = cluster_detections.prob.squeeze()  # (M,)
+            base_confidences = cluster_detections.prob.reshape(-1)  # (M,)
             base_weights = base_confidences / (base_confidences.sum() + 1e-8)
 
             aligned_sizes, aligned_yaws = self._align_boxes_r90(
@@ -623,9 +945,96 @@ class BoundingBox3DFuser:
                 cluster_detections, aligned_sizes, aligned_yaws
             )
 
-            # STEP 3: Fuse aligned sizes (weighted average)
-            weights_sizes = weights.view(-1, 1).expand_as(aligned_sizes)
-            fused_sizes = (aligned_sizes * weights_sizes).sum(dim=0)  # (3,)
+            # STEP 3: Fuse aligned yaw angles (weighted average with 180° symmetry)
+            mean_yaw, _ = self._weighted_yaw_mean(aligned_yaws, weights)
+
+            # Fuse translations and create the reference pose.
+            translations = torch.stack([pose.t for pose in poses])  # (M, 3)
+            weights_t = weights.view(-1, 1).expand_as(translations)
+            fused_translation = (translations * weights_t).sum(dim=0)  # (3,)
+            new_eulers = torch.tensor([0, 0, mean_yaw]).to(fused_translation)  # (3,)
+            new_eulers = new_eulers.reshape(1, 3)  # (1, 3)
+            fused_rotation = rotation_from_euler(new_eulers)[0]
+
+            # STEP 4: Estimate box extents. The robust-envelope mode projects
+            # every contributing box into the fused orientation and estimates
+            # its lower and upper faces independently. This avoids shrinking a
+            # long object when partial detections have shifted centers.
+            if self.extent_method in ("robust_envelope", "consensus_envelope"):
+                extent_indices = extent_clusters[cluster_index]
+                extent_detections = detections[extent_indices]
+                corners_world = extent_detections.bb3corners_world
+                corners_local = torch.matmul(
+                    corners_world - fused_translation.view(1, 1, 3),
+                    fused_rotation,
+                )
+                lower_faces = corners_local.min(dim=1).values
+                upper_faces = corners_local.max(dim=1).values
+                if self.extent_method == "consensus_envelope":
+                    primary_corners_world = cluster_detections.bb3corners_world
+                    primary_corners_local = torch.matmul(
+                        primary_corners_world - fused_translation.view(1, 1, 3),
+                        fused_rotation,
+                    )
+                    primary_lower = primary_corners_local.min(dim=1).values
+                    primary_upper = primary_corners_local.max(dim=1).values
+                    fallback_lower = weighted_quantile(
+                        primary_lower, weights, self.envelope_quantile
+                    )
+                    fallback_upper = weighted_quantile(
+                        primary_upper, weights, 1.0 - self.envelope_quantile
+                    )
+                    extent_group_ids = detection_group_ids[extent_indices]
+                    # Consensus expansion is intentionally limited to the
+                    # dominant object axis. Applying outer-face evidence to
+                    # depth and height can absorb walls, counters, or floors
+                    # when the 3D center is noisy across viewpoints.
+                    major_axis = int(
+                        torch.argmax(fallback_upper - fallback_lower).item()
+                    )
+                    lower = fallback_lower.clone()
+                    upper = fallback_upper.clone()
+                    consensus_lower = consensus_outer_face(
+                        lower_faces[:, major_axis],
+                        extent_group_ids,
+                        choose_lower=True,
+                        min_support=self.face_min_support,
+                        tolerance_m=self.face_tolerance_m,
+                        fallback=fallback_lower[major_axis],
+                    )
+                    consensus_upper = consensus_outer_face(
+                        upper_faces[:, major_axis],
+                        extent_group_ids,
+                        choose_lower=False,
+                        min_support=self.face_min_support,
+                        tolerance_m=self.face_tolerance_m,
+                        fallback=fallback_upper[major_axis],
+                    )
+                    # Consensus may expand the robust envelope, never shrink it.
+                    lower[major_axis] = torch.minimum(
+                        consensus_lower, fallback_lower[major_axis]
+                    )
+                    upper[major_axis] = torch.maximum(
+                        consensus_upper, fallback_upper[major_axis]
+                    )
+                else:
+                    lower = weighted_quantile(
+                        lower_faces, weights, self.envelope_quantile
+                    )
+                    upper = weighted_quantile(
+                        upper_faces, weights, 1.0 - self.envelope_quantile
+                    )
+                lower = lower - self.envelope_padding_m
+                upper = upper + self.envelope_padding_m
+                fused_sizes = (upper - lower).clamp_min(1e-4)
+                local_center = 0.5 * (lower + upper)
+                fused_translation = fused_translation + torch.matmul(
+                    fused_rotation, local_center
+                )
+            else:
+                weights_sizes = weights.view(-1, 1).expand_as(aligned_sizes)
+                fused_sizes = (aligned_sizes * weights_sizes).sum(dim=0)
+
             bb3_object = torch.stack(
                 [
                     -fused_sizes[0] / 2,
@@ -636,20 +1045,6 @@ class BoundingBox3DFuser:
                     fused_sizes[2] / 2,
                 ]
             )
-
-            # STEP 4: Fuse aligned yaw angles (weighted average with 180° symmetry)
-            mean_yaw, _ = self._weighted_yaw_mean(aligned_yaws, weights)
-
-            # Create fused pose with aligned yaw
-            # Fuse translations (same as before)
-            translations = torch.stack([pose.t for pose in poses])  # (M, 3)
-            weights_t = weights.view(-1, 1).expand_as(translations)
-            fused_translation = (translations * weights_t).sum(dim=0)  # (3,)
-
-            # Create fused rotation with mean yaw
-            new_eulers = torch.tensor([0, 0, mean_yaw]).to(fused_translation)  # (3,)
-            new_eulers = new_eulers.reshape(1, 3)  # (1, 3)
-            fused_rotation = rotation_from_euler(new_eulers)[0]
             fused_pose = PoseTW.from_Rt(fused_rotation, fused_translation)
 
             # Fuse confidence (weighted average)
@@ -724,7 +1119,7 @@ class BoundingBox3DFuser:
         Returns:
             Torch tensor of weights (sums to 1)
         """
-        confidences = detections.prob.squeeze()  # (M,)
+        confidences = detections.prob.reshape(-1)  # (M,)
 
         if self.confidence_weighting == "uniform":
             weights = torch.ones_like(confidences)
@@ -916,6 +1311,14 @@ def fuse_obbs_from_csv(
     iou_threshold: float = 0.3,
     min_detections: int = 4,
     conf_threshold: float = 0.55,
+    shower_fixture_conf_threshold: float = 0.4,
+    extent_method: str = "mean",
+    envelope_quantile: float = 0.4,
+    envelope_padding_m: float = 0.0,
+    extent_iou_threshold: float = 0.1,
+    face_min_support: int = 3,
+    face_tolerance_m: float = 0.15,
+    point_cloud_path: str | None = None,
 ) -> list[FusedInstance]:
     """
     Load OBBs from a CSV file, fuse them, and save the results.
@@ -926,6 +1329,16 @@ def fuse_obbs_from_csv(
         iou_threshold: IoU threshold for 3D box fusion
         min_detections: Minimum number of detections required to create an instance
         conf_threshold: Minimum confidence threshold to filter detections
+        shower_fixture_conf_threshold: Confidence threshold used only for
+            shower-fixture detections
+        extent_method: Fused extent estimator (``mean`` or ``robust_envelope``)
+        envelope_quantile: Trim quantile for robust lower/upper box faces
+        envelope_padding_m: Padding added to each robust-envelope face
+        extent_iou_threshold: Relaxed same-label overlap for extent evidence
+        face_min_support: Independent timestamps required per outer face
+        face_tolerance_m: Face consensus tolerance in metres
+        point_cloud_path: Aligned PLY used to derive axis-aligned SpatialLM
+            boxes from the fused object point subsets
 
     Returns:
         List of fused instances
@@ -934,17 +1347,24 @@ def fuse_obbs_from_csv(
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_fused{ext}"
+    spatiallm_output_path = os.path.join(
+        os.path.dirname(output_path) or ".", "spatiallm_bboxes.txt"
+    )
 
     print(f"==> Loading OBBs from {input_path}")
     timed_obbs = read_obb_csv(input_path)
 
     if len(timed_obbs) == 0:
         print("==> No OBBs found in input file, nothing to fuse")
+        write_spatiallm_bboxes(ObbTW(torch.zeros(0, 165)), spatiallm_output_path)
         return []
 
     # Concatenate all OBBs from all timestamps
     all_obbs_list = list(timed_obbs.values())
     all_obbs = torch.cat(all_obbs_list, dim=0)
+    detection_group_ids = torch.cat(
+        [torch.full((len(obbs),), index, dtype=torch.long) for index, obbs in enumerate(all_obbs_list)]
+    )
     print(f"==> Loaded {all_obbs.shape[0]} OBBs from {len(timed_obbs)} timestamps")
 
     # Create fuser and run fusion
@@ -956,12 +1376,23 @@ def fuse_obbs_from_csv(
         iou_threshold=iou_threshold,
         min_detections=min_detections,
         conf_threshold=conf_threshold,
+        shower_fixture_conf_threshold=shower_fixture_conf_threshold,
+        extent_method=extent_method,
+        envelope_quantile=envelope_quantile,
+        envelope_padding_m=envelope_padding_m,
+        extent_iou_threshold=extent_iou_threshold,
+        face_min_support=face_min_support,
+        face_tolerance_m=face_tolerance_m,
     )
-    fused_instances = fuser.fuse(all_obbs)
+    fused_instances = fuser.fuse(all_obbs, detection_group_ids=detection_group_ids)
     print(f"==> Fused into {len(fused_instances)} static instances")
 
     if len(fused_instances) == 0:
-        print("==> No fused instances produced, skipping output")
+        write_spatiallm_bboxes(ObbTW(torch.zeros(0, 165)), spatiallm_output_path)
+        print(
+            "==> No fused instances produced; saved an empty SpatialLM file to "
+            f"{spatiallm_output_path}"
+        )
         return []
 
     # Extract OBBs from fused instances
@@ -987,6 +1418,15 @@ def fuse_obbs_from_csv(
     writer.close()
     print(f"==> Saved {len(fused_instances)} fused OBBs to {output_path}")
 
+    spatiallm_lines = write_spatiallm_bboxes(
+        fused_obbs,
+        spatiallm_output_path,
+        point_cloud_path=point_cloud_path,
+    )
+    print(f"==> Saved SpatialLM bounding boxes to {spatiallm_output_path}")
+    for line in spatiallm_lines:
+        print(line)
+
     return fused_instances
 
 
@@ -1008,6 +1448,13 @@ def main() -> None:
         help="Path to output obb_fused.csv file (default: input path with _fused suffix)",
     )
     parser.add_argument(
+        "--point-cloud",
+        "--point_cloud",
+        dest="point_cloud",
+        default=None,
+        help="Aligned PLY used to write point-subset AABBs to spatiallm_bboxes.txt",
+    )
+    parser.add_argument(
         "--iou",
         type=float,
         default=0.3,
@@ -1025,6 +1472,48 @@ def main() -> None:
         default=0.55,
         help="Minimum confidence threshold to filter detections (default: 0.55)",
     )
+    parser.add_argument(
+        "--shower-fixture-conf-threshold",
+        type=float,
+        default=0.4,
+        help="Confidence threshold used only for shower fixtures (default: 0.4)",
+    )
+    parser.add_argument(
+        "--extent-method",
+        choices=("mean", "robust_envelope", "consensus_envelope"),
+        default="mean",
+        help="How to calculate fused box extents (default: mean)",
+    )
+    parser.add_argument(
+        "--envelope-quantile",
+        type=float,
+        default=0.4,
+        help="Robust-envelope trim quantile in [0, 0.5] (default: 0.4)",
+    )
+    parser.add_argument(
+        "--envelope-padding-m",
+        type=float,
+        default=0.0,
+        help="Padding added to each robust-envelope face in metres (default: 0.0)",
+    )
+    parser.add_argument(
+        "--extent-iou-threshold",
+        type=float,
+        default=0.1,
+        help="Relaxed same-label IoU for extent-only evidence (default: 0.1)",
+    )
+    parser.add_argument(
+        "--face-min-support",
+        type=int,
+        default=3,
+        help="Independent timestamps required to accept an outer face (default: 3)",
+    )
+    parser.add_argument(
+        "--face-tolerance-m",
+        type=float,
+        default=0.15,
+        help="Face consensus tolerance in metres (default: 0.15)",
+    )
     args = parser.parse_args()
 
     fuse_obbs_from_csv(
@@ -1033,6 +1522,14 @@ def main() -> None:
         iou_threshold=args.iou,
         min_detections=args.min_detections,
         conf_threshold=args.conf_threshold,
+        shower_fixture_conf_threshold=args.shower_fixture_conf_threshold,
+        extent_method=args.extent_method,
+        envelope_quantile=args.envelope_quantile,
+        envelope_padding_m=args.envelope_padding_m,
+        extent_iou_threshold=args.extent_iou_threshold,
+        face_min_support=args.face_min_support,
+        face_tolerance_m=args.face_tolerance_m,
+        point_cloud_path=args.point_cloud,
     )
 
 
