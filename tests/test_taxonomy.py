@@ -83,6 +83,15 @@ class TestLoadTextLabels:
         assert groups == [0, 0]
         assert canonicalize_detection_label("Sink") == "vanity"
 
+    def test_shower_uses_shower_room_prompt_and_canonical_label(self):
+        prompts, labels, groups = expand_detection_prompt_aliases(
+            ["shower", "shower room", "shower fixture"]
+        )
+        assert prompts == ["shower room", "shower fixture"]
+        assert labels == ["shower", "shower fixture"]
+        assert groups == [0, 1]
+        assert canonicalize_detection_label("Shower Room") == "shower"
+
     def test_custom_list_passthrough(self):
         """When given a list of strings that don't match a file, return as-is."""
         labels = ["cat", "dog", "bird"]

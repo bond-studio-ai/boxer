@@ -17,6 +17,8 @@ _LABELS_DIR = os.path.join(
 _DETECTION_PROMPT_ALIASES = {
     "vanity": ("vanity", "sink"),
     "sink": ("vanity", "sink"),
+    "shower": ("shower room",),
+    "shower room": ("shower room",),
 }
 
 
@@ -25,6 +27,8 @@ def canonicalize_detection_label(label: str) -> str:
     normalized = " ".join(label.strip().lower().replace("-", " ").split())
     if normalized in ("vanity", "sink"):
         return "vanity"
+    if normalized in ("shower", "shower room"):
+        return "shower"
     return label
 
 
